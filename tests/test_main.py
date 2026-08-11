@@ -218,3 +218,13 @@ def test_audit_documents_and_integrity(tmp_path, monkeypatch):
     assert audit["total_pdfs_on_disk_all_folders"] == 2
     assert audit["total_intact_pdfs_all_folders"] == 1
     assert audit["total_corrupted_pdfs_all_folders"] == 1
+
+
+def test_parse_cli_args(monkeypatch):
+    """Test CLI argument parsing for stage2 flag."""
+    from infomed.main import parse_cli_args
+
+    monkeypatch.setattr("sys.argv", ["main.py", "--stage2", "--no-headless"])
+    args = parse_cli_args()
+    assert args.stage_2_only is True
+    assert args.headless is False

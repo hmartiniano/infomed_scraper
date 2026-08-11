@@ -7,6 +7,7 @@ Playwright with a unified ACID SQLite persistence architecture, low-memory
 context recycling, and an automated Stage 2 targeted document retry pass.
 """
 
+import argparse
 import csv
 import gc
 import json
@@ -1073,12 +1074,14 @@ def create_browser_session(p: Any, headless: bool = True) -> Tuple[Any, Any, Pag
 def retrieve_infomed_rcms(
     headless: bool = True,
     db_path: str = DB_PATH,
+    stage_2_only: bool = False,
 ) -> Dict[str, Any]:
-    """Retrieve all RCMs, Leaflets, and metadata into SQLite with Stage 2 retry.
+    """Retrieve all RCMs, Leaflets, and metadata with automatic Stage 2 execution.
 
     Args:
         headless: Whether to run Playwright in headless mode.
         db_path: Path to SQLite database file.
+        stage_2_only: Whether to skip Stage 1 and run only Stage 2 targeted retry.
 
     Returns:
         Audit report dict summarizing scraped data and file integrity.
@@ -1104,102 +1107,130 @@ def retrieve_infomed_rcms(
 
     with sync_playwright() as p:
         browser, context, page = create_browser_session(p, headless=headless)
-        atc_categories = extract_atc_categories(page)
 
-        atc_count_in_session = 0
+        if not stage_2_only:
+            atc_categories = extract_atc_categories(page)
+            unprocessed_atcs = [
+                atc for atc in atc_categories if atc["value"] not in processed_atcs
+            ]
 
-        # Stage 1: Traverse all ATC categories
-        for atc in atc_categories:
-            atc_val = atc["value"]
-            if atc_val in processed_atcs:
-                continue
-
-            # 1. Periodic Browser Recycling & Dataset Checkpoint (every 100 ATCs)
-            should_recycle_browser = (
-                atc_count_in_session > 0
-                and atc_count_in_session % BROWSER_RECYCLE_INTERVAL == 0
-            )
-            should_recycle_context = (
-                atc_count_in_session > 0
-                and atc_count_in_session % CONTEXT_RECYCLE_INTERVAL == 0
-            )
-
-            if should_recycle_browser:
+            if not unprocessed_atcs:
                 logger.info(
-                    f"Recycling full browser process after {atc_count_in_session} "
-                    "ATCs and exporting dataset checkpoint..."
+                    f"All {len(atc_categories)} ATC categories have already been "
+                    "processed in Stage 1. Transitioning directly to Stage 2: "
+                    "Targeted Document Reconciliation..."
                 )
-                try:
-                    page.close()
-                    context.close()
-                    browser.close()
-                except Exception:
-                    pass
-                gc.collect()
-                export_db_to_datasets(db_path=db_path)
-                browser, context, page = create_browser_session(p, headless=headless)
-
-            # 2. Periodic Context Recycling (every 25 ATCs)
-            elif should_recycle_context:
+            else:
                 logger.info(
-                    f"Recycling browser context after {atc_count_in_session} "
-                    "ATCs to flush download buffers..."
-                )
-                try:
-                    page.close()
-                    context.close()
-                except Exception:
-                    pass
-                gc.collect()
-                context = browser.new_context(accept_downloads=True)
-                page = context.new_page()
-                page.set_default_timeout(15000)
-                page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
-
-            try:
-                records = process_atc_category(
-                    page,
-                    atc,
-                    TARGET_URL,
-                    downloaded_files=downloaded_files,
-                    download_dir_rcms=DOWNLOAD_DIR_RCMS,
-                    download_dir_leaflets=DOWNLOAD_DIR_LEAFLETS,
-                    download_dir_mmr=DOWNLOAD_DIR_MMR,
+                    f"Stage 1: {len(unprocessed_atcs)} / {len(atc_categories)} "
+                    "ATC categories remaining to process."
                 )
 
-                if records:
-                    upsert_medicamentos_batch(records, db_path=db_path)
+                atc_count_in_session = 0
 
-                processed_atcs.add(atc_val)
-                mark_atc_processed_in_db(atc_val, atc.get("label", ""), db_path=db_path)
-                atc_count_in_session += 1
+                # Stage 1: Traverse remaining ATC categories
+                for atc in unprocessed_atcs:
+                    atc_val = atc["value"]
 
-            except Exception as err:
-                logger.error(f"Error processing ATC '{atc_val}': {err}")
-                try:
-                    page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=20000)
-                    page.wait_for_selector(
-                        SEARCH_BUTTON_SELECTOR, state="visible", timeout=15000
+                    # Periodic Browser Recycling & Checkpoint (every 100 ATCs)
+                    should_recycle_browser = (
+                        atc_count_in_session > 0
+                        and atc_count_in_session % BROWSER_RECYCLE_INTERVAL == 0
                     )
-                except Exception as reload_err:
-                    logger.error(
-                        f"Failed to reload page: {reload_err}. Reopening fresh page..."
+                    should_recycle_context = (
+                        atc_count_in_session > 0
+                        and atc_count_in_session % CONTEXT_RECYCLE_INTERVAL == 0
                     )
-                    try:
-                        page.close()
-                        context.close()
+
+                    if should_recycle_browser:
+                        logger.info(
+                            f"Recycling full browser process after "
+                            f"{atc_count_in_session} ATCs and exporting checkpoint..."
+                        )
+                        try:
+                            page.close()
+                            context.close()
+                            browser.close()
+                        except Exception:
+                            pass
+                        gc.collect()
+                        export_db_to_datasets(db_path=db_path)
+                        browser, context, page = create_browser_session(
+                            p, headless=headless
+                        )
+
+                    # Periodic Context Recycling (every 25 ATCs)
+                    elif should_recycle_context:
+                        logger.info(
+                            f"Recycling browser context after "
+                            f"{atc_count_in_session} ATCs to flush download buffers..."
+                        )
+                        try:
+                            page.close()
+                            context.close()
+                        except Exception:
+                            pass
                         gc.collect()
                         context = browser.new_context(accept_downloads=True)
                         page = context.new_page()
                         page.set_default_timeout(15000)
                         page.goto(
-                            TARGET_URL, wait_until="domcontentloaded", timeout=20000
+                            TARGET_URL, wait_until="domcontentloaded", timeout=30000
                         )
-                        page.wait_for_selector(
-                            SEARCH_BUTTON_SELECTOR, state="visible", timeout=15000
+
+                    try:
+                        records = process_atc_category(
+                            page,
+                            atc,
+                            TARGET_URL,
+                            downloaded_files=downloaded_files,
+                            download_dir_rcms=DOWNLOAD_DIR_RCMS,
+                            download_dir_leaflets=DOWNLOAD_DIR_LEAFLETS,
+                            download_dir_mmr=DOWNLOAD_DIR_MMR,
                         )
-                    except Exception as page_err:
-                        logger.error(f"Failed to re-initialize page: {page_err}")
+
+                        if records:
+                            upsert_medicamentos_batch(records, db_path=db_path)
+
+                        processed_atcs.add(atc_val)
+                        mark_atc_processed_in_db(
+                            atc_val, atc.get("label", ""), db_path=db_path
+                        )
+                        atc_count_in_session += 1
+
+                    except Exception as err:
+                        logger.error(f"Error processing ATC '{atc_val}': {err}")
+                        try:
+                            page.goto(
+                                TARGET_URL, wait_until="domcontentloaded", timeout=20000
+                            )
+                            page.wait_for_selector(
+                                SEARCH_BUTTON_SELECTOR, state="visible", timeout=15000
+                            )
+                        except Exception as reload_err:
+                            logger.error(
+                                f"Failed to reload page: {reload_err}. "
+                                "Reopening page..."
+                            )
+                            try:
+                                page.close()
+                                context.close()
+                                gc.collect()
+                                context = browser.new_context(accept_downloads=True)
+                                page = context.new_page()
+                                page.set_default_timeout(15000)
+                                page.goto(
+                                    TARGET_URL,
+                                    wait_until="domcontentloaded",
+                                    timeout=20000,
+                                )
+                                page.wait_for_selector(
+                                    SEARCH_BUTTON_SELECTOR,
+                                    state="visible",
+                                    timeout=15000,
+                                )
+                            except Exception as page_err:
+                                logger.error(f"Failed to re-init page: {page_err}")
 
         # Stage 2: Targeted Document Reconciliation Pass
         retry_missing_documents(
@@ -1230,5 +1261,42 @@ def retrieve_infomed_rcms(
     return audit
 
 
+def parse_cli_args() -> argparse.Namespace:
+    """Parse command-line arguments for the scraper.
+
+    Returns:
+        Parsed arguments namespace.
+
+    """
+    parser = argparse.ArgumentParser(
+        description="INFOMED Scraper: Download RCMs, Leaflets, and drug metadata."
+    )
+    parser.add_argument(
+        "--stage2",
+        "--retry-only",
+        action="store_true",
+        dest="stage_2_only",
+        help="Skip Stage 1 (ATC traversal) and run only Stage 2 targeted retry.",
+    )
+    parser.add_argument(
+        "--no-headless",
+        action="store_false",
+        dest="headless",
+        help="Run browser in visible mode (default: headless).",
+    )
+    parser.add_argument(
+        "--db",
+        type=str,
+        default=DB_PATH,
+        help=f"Path to SQLite database (default: '{DB_PATH}').",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    retrieve_infomed_rcms(headless=True)
+    args = parse_cli_args()
+    retrieve_infomed_rcms(
+        headless=args.headless,
+        db_path=args.db,
+        stage_2_only=args.stage_2_only,
+    )
