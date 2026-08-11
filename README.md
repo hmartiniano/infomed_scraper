@@ -1,18 +1,20 @@
 # Infomed RCM, Patient Leaflet & Drug Data Scraper
 
-A robust Python browser automation tool built with Playwright and `uv` to scrape comprehensive medicine metadata, Resumo das Características do Medicamento (RCM / SmPC) documents, and Folhetos Informativos (FI / Patient Leaflets) from the INFOMED JSF extranet portal.
+A robust Python browser automation tool built with Playwright and `uv` to scrape comprehensive medicine metadata, Resumo das Características do Medicamento (RCM / SmPC) documents, and Folhetos Informativos (FI / Patient Leaflets) from the INFOMED JSF extranet portal into an ACID SQLite database and structured dataset exports.
 
 ## Features
+- **ACID SQLite Persistence**: All medicine records and ATC taxonomy mappings are incrementally upserted into an SQLite database (`medicamentos.db`), guaranteeing durability against crashes and eliminating repetitive text file I/O overhead.
+- **Automated Dataset Exports**: Automatically serializes `medicamentos.db` to `medicamentos.json` and `medicamentos.csv` upon completion and at periodic checkpoints.
 - **Comprehensive Metadata Extraction**: Extracts all drug attributes including Registration / Med ID, Trade Name, Active Substance (INN/DCI), Pharmaceutical Form, Dosage / Strength, Marketing Authorization Holder (MAH), Marketed Status, Authorization Status, WHO ATC Classifications, and document flags.
-- **Structured Dataset Exports**: Automatically streams and updates both `medicamentos.json` and `medicamentos.csv`.
 - **RCM & Leaflet Document Downloading**:
   - SmPC documents (RCM) saved directly to `downloads/rcms/`.
   - Patient Information Leaflets (FI) saved to `downloads/leaflets/`.
   - Risk Minimization Materials (MMR) saved to `downloads/mmr/`.
+- **Low-Memory Browser Recycling**: Periodically recycles Playwright browser contexts (every 25 ATCs) and Chromium processes (every 100 ATCs) with tight memory caps to keep system RAM under ~200 MB.
 - **Multi-Point PDF Integrity Verification**: Every downloaded file is validated against `%PDF-` header magic bytes, `%%EOF` trailer markers, size requirements, and `pdfinfo` structure checks.
 - **Completeness & Integrity Auditing**: Generates a detailed `audit_report.json` reporting total medicines, available documents on the portal, download success rates, and PDF integrity rates across all folders.
 - **Duplicate Prevention & Caching**: Automatically skips re-downloading files that already exist on disk and pass integrity verification.
-- **Progress Persistence**: Saves processed ATC codes, document URLs, and downloaded filenames to `atc_progress.json` to allow seamless resuming.
+- **Progress Persistence**: Saves processed ATC codes and downloaded filenames to `atc_progress.json` to allow seamless resuming.
 - **JSF State & Session Error Recovery**: Handles network timeouts and JSF ViewState desynchronization by automatically resetting and re-establishing clean browser sessions.
 
 ## Setup & Prerequisites

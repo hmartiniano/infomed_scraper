@@ -4,11 +4,13 @@ import os
 
 from infomed.main import (
     audit_documents_and_integrity,
-    load_medicamentos,
+    export_db_to_datasets,
+    init_db,
+    load_all_medicamentos_from_db,
     load_progress,
     sanitize_filename,
-    save_dataset,
     save_progress,
+    upsert_medicamentos_batch,
     validate_pdf,
 )
 
@@ -80,51 +82,86 @@ def test_progress_save_and_load(tmp_path, monkeypatch):
     assert loaded["downloaded_files"] == downloaded_files
 
 
-def test_save_and_load_medicamentos(tmp_path, monkeypatch):
-    """Test serializing and loading structured medicine datasets in JSON & CSV."""
-    json_path = str(tmp_path / "medicamentos.json")
-    csv_path = str(tmp_path / "medicamentos.csv")
-    monkeypatch.setattr("infomed.main.MEDICAMENTOS_JSON", json_path)
-    monkeypatch.setattr("infomed.main.MEDICAMENTOS_CSV", csv_path)
+def test_sqlite_db_upsert_and_export(tmp_path):
+    """Test SQLite database initialization, upsert with merging, and export."""
+    db_path = str(tmp_path / "test_medicamentos.db")
+    json_path = str(tmp_path / "test_medicamentos.json")
+    csv_path = str(tmp_path / "test_medicamentos.csv")
 
-    medicines = {
-        "599044_Glimepirida": {
-            "id_key": "599044_Glimepirida",
-            "med_id": "599044",
-            "drug_name": "Glimepirida Aurovitas",
-            "active_substance": "Glimepirida",
-            "pharma_form": "Comprimido",
-            "dosage": "2 mg",
-            "mah": "Aurovitas Unipessoal, Lda.",
-            "commercialization": "Comercializado",
-            "aim_status": "Autorizado",
-            "atc_codes": ["A10BB12"],
-            "atc_labels": ["A10BB12 - glimepiride"],
-            "has_rcm": True,
-            "rcm_filename": "599044_Glimepirida.pdf",
-            "rcm_downloaded": True,
-            "rcm_verified": True,
-            "has_fi": True,
-            "fi_filename": "599044_Glimepirida_FI.pdf",
-            "fi_downloaded": True,
-            "fi_verified": True,
-            "has_mmr": False,
-            "mmr_filename": None,
-            "mmr_downloaded": False,
-            "mmr_verified": False,
-        }
+    init_db(db_path=db_path)
+
+    # 1. First insert
+    record_1 = {
+        "id_key": "599044_Glimepirida",
+        "med_id": "599044",
+        "drug_name": "Glimepirida Aurovitas",
+        "active_substance": "Glimepirida",
+        "pharma_form": "Comprimido",
+        "dosage": "2 mg",
+        "mah": "Aurovitas Unipessoal, Lda.",
+        "commercialization": "Comercializado",
+        "aim_status": "Autorizado",
+        "atc_codes": ["A10BB12"],
+        "atc_labels": ["A10BB12 - glimepiride"],
+        "has_rcm": True,
+        "rcm_filename": "599044_Glimepirida.pdf",
+        "rcm_downloaded": True,
+        "rcm_verified": True,
+        "has_fi": True,
+        "fi_filename": "599044_Glimepirida_FI.pdf",
+        "fi_downloaded": True,
+        "fi_verified": True,
+        "has_mmr": False,
+        "mmr_filename": None,
+        "mmr_downloaded": False,
+        "mmr_verified": False,
     }
 
-    save_dataset(medicines, json_path=json_path, csv_path=csv_path)
+    upsert_medicamentos_batch([record_1], db_path=db_path)
 
+    loaded = load_all_medicamentos_from_db(db_path=db_path)
+    assert "599044_Glimepirida" in loaded
+    assert loaded["599044_Glimepirida"]["drug_name"] == "Glimepirida Aurovitas"
+    assert loaded["599044_Glimepirida"]["atc_codes"] == ["A10BB12"]
+
+    # 2. Upsert same drug under second ATC code
+    record_1_update = {
+        "id_key": "599044_Glimepirida",
+        "med_id": "599044",
+        "drug_name": "Glimepirida Aurovitas",
+        "active_substance": "Glimepirida",
+        "pharma_form": "Comprimido",
+        "dosage": "2 mg",
+        "mah": "Aurovitas Unipessoal, Lda.",
+        "commercialization": "Comercializado",
+        "aim_status": "Autorizado",
+        "atc_codes": ["A10BD99"],
+        "atc_labels": ["A10BD99 - glimepiride combination"],
+        "has_rcm": True,
+        "rcm_filename": "599044_Glimepirida.pdf",
+        "rcm_downloaded": True,
+        "rcm_verified": True,
+        "has_fi": True,
+        "fi_filename": "599044_Glimepirida_FI.pdf",
+        "fi_downloaded": True,
+        "fi_verified": True,
+        "has_mmr": False,
+        "mmr_filename": None,
+        "mmr_downloaded": False,
+        "mmr_verified": False,
+    }
+
+    upsert_medicamentos_batch([record_1_update], db_path=db_path)
+
+    loaded_merged = load_all_medicamentos_from_db(db_path=db_path)
+    assert len(loaded_merged) == 1
+    assert "A10BB12" in loaded_merged["599044_Glimepirida"]["atc_codes"]
+    assert "A10BD99" in loaded_merged["599044_Glimepirida"]["atc_codes"]
+
+    # 3. Export to JSON and CSV
+    export_db_to_datasets(db_path=db_path, json_path=json_path, csv_path=csv_path)
     assert os.path.exists(json_path)
     assert os.path.exists(csv_path)
-
-    loaded = load_medicamentos()
-    assert "599044_Glimepirida" in loaded
-    assert loaded["599044_Glimepirida"]["has_fi"] is True
-    assert loaded["599044_Glimepirida"]["fi_filename"] == "599044_Glimepirida_FI.pdf"
-    assert "rcm_url" not in loaded["599044_Glimepirida"]
 
 
 def test_audit_documents_and_integrity(tmp_path, monkeypatch):

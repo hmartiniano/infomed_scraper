@@ -3,7 +3,8 @@
 This module automates the extraction of comprehensive medicine metadata,
 RCM (Resumo das Características do Medicamento / SmPC) PDFs, and FI (Folheto
 Informativo / Patient Leaflet) PDFs from the INFOMED JSF extranet portal using
-Playwright with aggressive memory management and context recycling.
+Playwright with an ACID-compliant SQLite persistence layer and low-memory
+context recycling.
 """
 
 import csv
@@ -12,6 +13,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -27,6 +29,7 @@ logger = logging.getLogger("infomed")
 
 TARGET_URL = "https://extranet.infarmed.pt/INFOMED-fo/pesquisa-avancada.xhtml"
 PROGRESS_FILE = "atc_progress.json"
+DB_PATH = "medicamentos.db"
 MEDICAMENTOS_JSON = "medicamentos.json"
 MEDICAMENTOS_CSV = "medicamentos.csv"
 AUDIT_REPORT_FILE = "audit_report.json"
@@ -61,6 +64,289 @@ DISABLED_NEXT_PAGE_SELECTOR = "a.ui-paginator-next.ui-state-disabled"
 RCM_ICON_SELECTOR = "a[id*='pesqAvancadaDatableRcmIcon']"
 FI_ICON_SELECTOR = "a[id*='pesqAvancadaDatableFiIcon']"
 MMR_ICON_SELECTOR = "a[id*='pesqAvancadaDatableMmrIcon']"
+
+CSV_FIELDNAMES = [
+    "id_key",
+    "med_id",
+    "drug_name",
+    "active_substance",
+    "pharma_form",
+    "dosage",
+    "mah",
+    "commercialization",
+    "aim_status",
+    "atc_codes",
+    "atc_labels",
+    "has_rcm",
+    "rcm_filename",
+    "rcm_downloaded",
+    "rcm_verified",
+    "has_fi",
+    "fi_filename",
+    "fi_downloaded",
+    "fi_verified",
+    "has_mmr",
+    "mmr_filename",
+    "mmr_downloaded",
+    "mmr_verified",
+]
+
+
+def init_db(db_path: str = DB_PATH, auto_migrate: bool = True) -> None:
+    """Initialize SQLite database with schema and auto-migrate JSON if needed.
+
+    Args:
+        db_path: Path to SQLite database file.
+        auto_migrate: Whether to auto-migrate existing JSON into empty database.
+
+    """
+    with sqlite3.connect(db_path, timeout=30.0) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS medicamentos (
+                id_key TEXT PRIMARY KEY,
+                med_id TEXT,
+                drug_name TEXT,
+                active_substance TEXT,
+                pharma_form TEXT,
+                dosage TEXT,
+                mah TEXT,
+                commercialization TEXT,
+                aim_status TEXT,
+                atc_codes TEXT,
+                atc_labels TEXT,
+                has_rcm INTEGER,
+                rcm_filename TEXT,
+                rcm_downloaded INTEGER,
+                rcm_verified INTEGER,
+                has_fi INTEGER,
+                fi_filename TEXT,
+                fi_downloaded INTEGER,
+                fi_verified INTEGER,
+                has_mmr INTEGER,
+                mmr_filename TEXT,
+                mmr_downloaded INTEGER,
+                mmr_verified INTEGER,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.commit()
+
+        # Check if table is empty and JSON exists for auto-migration
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM medicamentos")
+        count = cursor.fetchone()[0]
+
+        if (
+            auto_migrate
+            and db_path == DB_PATH
+            and count == 0
+            and os.path.exists(MEDICAMENTOS_JSON)
+        ):
+            try:
+                with open(MEDICAMENTOS_JSON, "r", encoding="utf-8") as f:
+                    json_records = json.load(f)
+                if json_records:
+                    logger.info(
+                        f"Auto-migrating {len(json_records)} records from JSON "
+                        f"into SQLite '{db_path}'..."
+                    )
+                    upsert_medicamentos_batch(json_records, db_path=db_path)
+            except Exception as err:
+                logger.warning(f"Failed to auto-migrate JSON to SQLite: {err}")
+
+
+def upsert_medicamentos_batch(
+    records: List[Dict[str, Any]],
+    db_path: str = DB_PATH,
+) -> None:
+    """Insert or update a batch of medicine records in SQLite atomically.
+
+    Args:
+        records: List of medicine record dictionaries.
+        db_path: Path to SQLite database file.
+
+    """
+    if not records:
+        return
+
+    with sqlite3.connect(db_path, timeout=30.0) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        cursor = conn.cursor()
+
+        for r in records:
+            id_key = r["id_key"]
+
+            # Query existing record to merge ATC codes and labels
+            cursor.execute(
+                "SELECT atc_codes, atc_labels, rcm_downloaded, fi_downloaded "
+                "FROM medicamentos WHERE id_key = ?",
+                (id_key,),
+            )
+            row = cursor.fetchone()
+
+            atc_codes = list(r.get("atc_codes", []))
+            atc_labels = list(r.get("atc_labels", []))
+            rcm_downloaded = 1 if r.get("rcm_downloaded") else 0
+            fi_downloaded = 1 if r.get("fi_downloaded") else 0
+            mmr_downloaded = 1 if r.get("mmr_downloaded") else 0
+
+            if row:
+                existing_codes = json.loads(row[0]) if row[0] else []
+                existing_labels = json.loads(row[1]) if row[1] else []
+                for c in existing_codes:
+                    if c not in atc_codes:
+                        atc_codes.append(c)
+                for lbl in existing_labels:
+                    if lbl not in atc_labels:
+                        atc_labels.append(lbl)
+                rcm_downloaded = 1 if (row[2] or rcm_downloaded) else 0
+                fi_downloaded = 1 if (row[3] or fi_downloaded) else 0
+
+            cursor.execute(
+                """
+                INSERT INTO medicamentos (
+                    id_key, med_id, drug_name, active_substance, pharma_form,
+                    dosage, mah, commercialization, aim_status, atc_codes,
+                    atc_labels, has_rcm, rcm_filename, rcm_downloaded,
+                    rcm_verified, has_fi, fi_filename, fi_downloaded,
+                    fi_verified, has_mmr, mmr_filename, mmr_downloaded,
+                    mmr_verified, updated_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, CURRENT_TIMESTAMP
+                )
+                ON CONFLICT(id_key) DO UPDATE SET
+                    med_id = excluded.med_id,
+                    drug_name = excluded.drug_name,
+                    active_substance = excluded.active_substance,
+                    pharma_form = excluded.pharma_form,
+                    dosage = excluded.dosage,
+                    mah = excluded.mah,
+                    commercialization = excluded.commercialization,
+                    aim_status = excluded.aim_status,
+                    atc_codes = excluded.atc_codes,
+                    atc_labels = excluded.atc_labels,
+                    has_rcm = excluded.has_rcm,
+                    rcm_filename = excluded.rcm_filename,
+                    rcm_downloaded = excluded.rcm_downloaded,
+                    rcm_verified = excluded.rcm_verified,
+                    has_fi = excluded.has_fi,
+                    fi_filename = excluded.fi_filename,
+                    fi_downloaded = excluded.fi_downloaded,
+                    fi_verified = excluded.fi_verified,
+                    has_mmr = excluded.has_mmr,
+                    mmr_filename = excluded.mmr_filename,
+                    mmr_downloaded = excluded.mmr_downloaded,
+                    mmr_verified = excluded.mmr_verified,
+                    updated_at = CURRENT_TIMESTAMP;
+                """,
+                (
+                    id_key,
+                    r.get("med_id", ""),
+                    r.get("drug_name", ""),
+                    r.get("active_substance", ""),
+                    r.get("pharma_form", ""),
+                    r.get("dosage", ""),
+                    r.get("mah", ""),
+                    r.get("commercialization", ""),
+                    r.get("aim_status", ""),
+                    json.dumps(atc_codes, ensure_ascii=False),
+                    json.dumps(atc_labels, ensure_ascii=False),
+                    1 if r.get("has_rcm") else 0,
+                    r.get("rcm_filename"),
+                    rcm_downloaded,
+                    rcm_downloaded,
+                    1 if r.get("has_fi") else 0,
+                    r.get("fi_filename"),
+                    fi_downloaded,
+                    fi_downloaded,
+                    1 if r.get("has_mmr") else 0,
+                    r.get("mmr_filename"),
+                    mmr_downloaded,
+                    mmr_downloaded,
+                ),
+            )
+        conn.commit()
+
+
+def load_all_medicamentos_from_db(
+    db_path: str = DB_PATH,
+) -> Dict[str, Dict[str, Any]]:
+    """Load all records from SQLite into a dictionary keyed by id_key.
+
+    Args:
+        db_path: Path to SQLite database file.
+
+    Returns:
+        Dict mapping id_key to structured medicine dictionary.
+
+    """
+    if not os.path.exists(db_path):
+        return {}
+
+    medicines = {}
+    with sqlite3.connect(db_path, timeout=30.0) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM medicamentos ORDER BY id_key")
+        for row in cursor.fetchall():
+            d = dict(row)
+            d["atc_codes"] = json.loads(d["atc_codes"]) if d["atc_codes"] else []
+            d["atc_labels"] = json.loads(d["atc_labels"]) if d["atc_labels"] else []
+            d["has_rcm"] = bool(d["has_rcm"])
+            d["rcm_downloaded"] = bool(d["rcm_downloaded"])
+            d["rcm_verified"] = bool(d["rcm_verified"])
+            d["has_fi"] = bool(d["has_fi"])
+            d["fi_downloaded"] = bool(d["fi_downloaded"])
+            d["fi_verified"] = bool(d["fi_verified"])
+            d["has_mmr"] = bool(d["has_mmr"])
+            d["mmr_downloaded"] = bool(d["mmr_downloaded"])
+            d["mmr_verified"] = bool(d["mmr_verified"])
+            medicines[d["id_key"]] = d
+    return medicines
+
+
+def export_db_to_datasets(
+    db_path: str = DB_PATH,
+    json_path: str = MEDICAMENTOS_JSON,
+    csv_path: str = MEDICAMENTOS_CSV,
+) -> None:
+    """Export SQLite database to JSON and CSV datasets.
+
+    Args:
+        db_path: Path to SQLite database file.
+        json_path: Target path for the JSON export.
+        csv_path: Target path for the CSV export.
+
+    """
+    medicines = load_all_medicamentos_from_db(db_path=db_path)
+    records = list(medicines.values())
+
+    try:
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(records, f, indent=2, ensure_ascii=False)
+    except Exception as err:
+        logger.error(f"Failed to export JSON dataset: {err}")
+
+    if not records:
+        return
+
+    try:
+        with open(csv_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES, extrasaction="ignore")
+            writer.writeheader()
+            for r in records:
+                row = dict(r)
+                if isinstance(row.get("atc_codes"), list):
+                    row["atc_codes"] = "; ".join(row["atc_codes"])
+                if isinstance(row.get("atc_labels"), list):
+                    row["atc_labels"] = "; ".join(row["atc_labels"])
+                writer.writerow(row)
+    except Exception as err:
+        logger.error(f"Failed to export CSV dataset: {err}")
 
 
 def validate_pdf(filepath: str) -> bool:
@@ -175,94 +461,6 @@ def save_progress(
             )
     except Exception as err:
         logger.error(f"Failed to save progress: {err}")
-
-
-def load_medicamentos() -> Dict[str, Dict[str, Any]]:
-    """Load previously scraped medicine records from JSON file.
-
-    Returns:
-        Dict mapping unique medicine identifier keys to their drug record dicts.
-
-    """
-    if os.path.exists(MEDICAMENTOS_JSON):
-        try:
-            with open(MEDICAMENTOS_JSON, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                cleaned = {}
-                for item in data:
-                    if "id_key" in item:
-                        item.pop("rcm_url", None)
-                        item.pop("fi_url", None)
-                        item.pop("mmr_url", None)
-                        cleaned[item["id_key"]] = item
-                return cleaned
-        except Exception as err:
-            logger.warning(f"Failed to load existing medicamentos file: {err}")
-    return {}
-
-
-def save_dataset(
-    medicines: Dict[str, Dict[str, Any]],
-    json_path: str = MEDICAMENTOS_JSON,
-    csv_path: str = MEDICAMENTOS_CSV,
-) -> None:
-    """Export complete medicine records into JSON and CSV files.
-
-    Args:
-        medicines: Dict mapping unique medicine keys to their metadata dicts.
-        json_path: Target path for the JSON export.
-        csv_path: Target path for the CSV export.
-
-    """
-    records = list(medicines.values())
-    try:
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(records, f, indent=2, ensure_ascii=False)
-    except Exception as err:
-        logger.error(f"Failed to save JSON dataset: {err}")
-
-    if not records:
-        return
-
-    fieldnames = [
-        "id_key",
-        "med_id",
-        "drug_name",
-        "active_substance",
-        "pharma_form",
-        "dosage",
-        "mah",
-        "commercialization",
-        "aim_status",
-        "atc_codes",
-        "atc_labels",
-        "has_rcm",
-        "rcm_filename",
-        "rcm_downloaded",
-        "rcm_verified",
-        "has_fi",
-        "fi_filename",
-        "fi_downloaded",
-        "fi_verified",
-        "has_mmr",
-        "mmr_filename",
-        "mmr_downloaded",
-        "mmr_verified",
-    ]
-
-    try:
-        with open(csv_path, "w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-            writer.writeheader()
-            for r in records:
-                row = dict(r)
-                if isinstance(row.get("atc_codes"), list):
-                    row["atc_codes"] = "; ".join(row["atc_codes"])
-                if isinstance(row.get("atc_labels"), list):
-                    row["atc_labels"] = "; ".join(row["atc_labels"])
-                writer.writerow(row)
-    except Exception as err:
-        logger.error(f"Failed to save CSV dataset: {err}")
 
 
 def extract_atc_categories(page: Page) -> List[Dict[str, str]]:
@@ -688,31 +886,37 @@ def create_browser_session(p: Any, headless: bool = True) -> Tuple[Any, Any, Pag
     return browser, context, page
 
 
-def retrieve_infomed_rcms(headless: bool = True) -> Dict[str, Any]:
-    """Retrieve all RCMs, Leaflets, and metadata with aggressive memory recycling.
+def retrieve_infomed_rcms(
+    headless: bool = True,
+    db_path: str = DB_PATH,
+) -> Dict[str, Any]:
+    """Retrieve all RCMs, Leaflets, and metadata into SQLite with context recycling.
 
     Args:
         headless: Whether to run Playwright in headless mode.
+        db_path: Path to SQLite database file.
 
     Returns:
         Audit report dict summarizing scraped data and file integrity.
 
     """
+    init_db(db_path=db_path)
+
     progress = load_progress()
     processed_atcs: Set[str] = progress["processed_atcs"]
     downloaded_files: Set[str] = progress.get("downloaded_files", set())
 
-    # Pre-populate downloaded_files with existing valid PDFs across folders
     for d in (DOWNLOAD_DIR_RCMS, DOWNLOAD_DIR_LEAFLETS, DOWNLOAD_DIR_MMR):
         if os.path.exists(d):
             for fname in os.listdir(d):
                 if fname.lower().endswith(".pdf"):
                     downloaded_files.add(fname)
 
-    medicines_dict = load_medicamentos()
+    existing_db_meds = load_all_medicamentos_from_db(db_path=db_path)
     logger.info(
-        f"Starting pipeline: {len(processed_atcs)} ATCs completed, "
-        f"{len(medicines_dict)} drugs recorded, {len(downloaded_files)} PDFs saved."
+        f"Starting pipeline with SQLite persistence: {len(processed_atcs)} "
+        f"ATCs completed, {len(existing_db_meds)} drugs in DB, "
+        f"{len(downloaded_files)} PDFs saved."
     )
 
     with sync_playwright() as p:
@@ -726,7 +930,7 @@ def retrieve_infomed_rcms(headless: bool = True) -> Dict[str, Any]:
             if atc_val in processed_atcs:
                 continue
 
-            # 1. Periodic Browser Recycling (every 100 ATCs)
+            # 1. Periodic Browser Recycling & Dataset Checkpoint (every 100 ATCs)
             should_recycle_browser = (
                 atc_count_in_session > 0
                 and atc_count_in_session % BROWSER_RECYCLE_INTERVAL == 0
@@ -739,7 +943,7 @@ def retrieve_infomed_rcms(headless: bool = True) -> Dict[str, Any]:
             if should_recycle_browser:
                 logger.info(
                     f"Recycling full browser process after {atc_count_in_session} "
-                    "ATCs to release all Chromium memory..."
+                    "ATCs and exporting dataset checkpoint..."
                 )
                 try:
                     page.close()
@@ -748,6 +952,7 @@ def retrieve_infomed_rcms(headless: bool = True) -> Dict[str, Any]:
                 except Exception:
                     pass
                 gc.collect()
+                export_db_to_datasets(db_path=db_path)
                 browser, context, page = create_browser_session(p, headless=headless)
 
             # 2. Periodic Context Recycling (every 25 ATCs)
@@ -778,31 +983,12 @@ def retrieve_infomed_rcms(headless: bool = True) -> Dict[str, Any]:
                     download_dir_mmr=DOWNLOAD_DIR_MMR,
                 )
 
-                for r in records:
-                    k = r["id_key"]
-                    if k in medicines_dict:
-                        existing = medicines_dict[k]
-                        for c in r.get("atc_codes", []):
-                            if c not in existing.setdefault("atc_codes", []):
-                                existing["atc_codes"].append(c)
-                        for lbl in r.get("atc_labels", []):
-                            if lbl not in existing.setdefault("atc_labels", []):
-                                existing["atc_labels"].append(lbl)
-                        for flag_key, ver_key in (
-                            ("rcm_downloaded", "rcm_verified"),
-                            ("fi_downloaded", "fi_verified"),
-                            ("mmr_downloaded", "mmr_verified"),
-                        ):
-                            if r.get(flag_key):
-                                existing[flag_key] = True
-                                existing[ver_key] = True
-                    else:
-                        medicines_dict[k] = r
+                if records:
+                    upsert_medicamentos_batch(records, db_path=db_path)
 
                 processed_atcs.add(atc_val)
                 atc_count_in_session += 1
                 save_progress(processed_atcs, downloaded_files)
-                save_dataset(medicines_dict)
 
             except Exception as err:
                 logger.error(f"Error processing ATC '{atc_val}': {err}")
@@ -838,9 +1024,11 @@ def retrieve_infomed_rcms(headless: bool = True) -> Dict[str, Any]:
         except Exception:
             pass
 
-    save_dataset(medicines_dict)
+    # Final export of SQLite to JSON and CSV
+    export_db_to_datasets(db_path=db_path)
+    all_final_meds = load_all_medicamentos_from_db(db_path=db_path)
     audit = audit_documents_and_integrity(
-        medicines_dict,
+        all_final_meds,
         download_dir_rcms=DOWNLOAD_DIR_RCMS,
         download_dir_leaflets=DOWNLOAD_DIR_LEAFLETS,
         download_dir_mmr=DOWNLOAD_DIR_MMR,
