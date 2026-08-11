@@ -7,9 +7,9 @@ from infomed.main import (
     export_db_to_datasets,
     init_db,
     load_all_medicamentos_from_db,
-    load_progress,
+    load_atc_progress_from_db,
+    mark_atc_processed_in_db,
     sanitize_filename,
-    save_progress,
     upsert_medicamentos_batch,
     validate_pdf,
 )
@@ -67,19 +67,16 @@ def test_validate_pdf_invalid(tmp_path):
     assert validate_pdf(str(no_trailer)) is False
 
 
-def test_progress_save_and_load(tmp_path, monkeypatch):
-    """Test saving and loading execution progress including downloaded files."""
-    test_progress_file = str(tmp_path / "test_progress.json")
-    monkeypatch.setattr("infomed.main.PROGRESS_FILE", test_progress_file)
+def test_atc_progress_in_sqlite(tmp_path):
+    """Test recording and loading ATC progress directly in SQLite."""
+    db_path = str(tmp_path / "test_progress.db")
+    init_db(db_path=db_path, auto_migrate=False)
 
-    atcs = {"REF_ATC_1", "REF_ATC_2"}
-    downloaded_files = {"rcm_100.pdf", "leaflet_101.pdf"}
+    mark_atc_processed_in_db("REF_ATC_1", "Category 1", db_path=db_path)
+    mark_atc_processed_in_db("REF_ATC_2", "Category 2", db_path=db_path)
 
-    save_progress(atcs, downloaded_files)
-
-    loaded = load_progress()
-    assert loaded["processed_atcs"] == atcs
-    assert loaded["downloaded_files"] == downloaded_files
+    loaded = load_atc_progress_from_db(db_path=db_path)
+    assert loaded == {"REF_ATC_1", "REF_ATC_2"}
 
 
 def test_sqlite_db_upsert_and_export(tmp_path):
@@ -88,9 +85,8 @@ def test_sqlite_db_upsert_and_export(tmp_path):
     json_path = str(tmp_path / "test_medicamentos.json")
     csv_path = str(tmp_path / "test_medicamentos.csv")
 
-    init_db(db_path=db_path)
+    init_db(db_path=db_path, auto_migrate=False)
 
-    # 1. First insert
     record_1 = {
         "id_key": "599044_Glimepirida",
         "med_id": "599044",
@@ -124,7 +120,6 @@ def test_sqlite_db_upsert_and_export(tmp_path):
     assert loaded["599044_Glimepirida"]["drug_name"] == "Glimepirida Aurovitas"
     assert loaded["599044_Glimepirida"]["atc_codes"] == ["A10BB12"]
 
-    # 2. Upsert same drug under second ATC code
     record_1_update = {
         "id_key": "599044_Glimepirida",
         "med_id": "599044",
@@ -158,7 +153,6 @@ def test_sqlite_db_upsert_and_export(tmp_path):
     assert "A10BB12" in loaded_merged["599044_Glimepirida"]["atc_codes"]
     assert "A10BD99" in loaded_merged["599044_Glimepirida"]["atc_codes"]
 
-    # 3. Export to JSON and CSV
     export_db_to_datasets(db_path=db_path, json_path=json_path, csv_path=csv_path)
     assert os.path.exists(json_path)
     assert os.path.exists(csv_path)
@@ -176,11 +170,9 @@ def test_audit_documents_and_integrity(tmp_path, monkeypatch):
     leaflet_dir.mkdir()
     mmr_dir.mkdir()
 
-    # Valid RCM PDF
     valid_rcm = rcm_dir / "valid_rcm.pdf"
     valid_rcm.write_bytes(MINIMAL_VALID_PDF)
 
-    # Corrupted Leaflet PDF
     corrupted_fi = leaflet_dir / "corrupted_fi.pdf"
     corrupted_fi.write_bytes(b"INVALID PDF CONTENT")
 

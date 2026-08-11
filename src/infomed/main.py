@@ -3,8 +3,8 @@
 This module automates the extraction of comprehensive medicine metadata,
 RCM (Resumo das Características do Medicamento / SmPC) PDFs, and FI (Folheto
 Informativo / Patient Leaflet) PDFs from the INFOMED JSF extranet portal using
-Playwright with an ACID-compliant SQLite persistence layer and low-memory
-context recycling.
+Playwright with a unified ACID SQLite persistence architecture, low-memory
+context recycling, and an automated Stage 2 targeted document retry pass.
 """
 
 import csv
@@ -64,6 +64,7 @@ DISABLED_NEXT_PAGE_SELECTOR = "a.ui-paginator-next.ui-state-disabled"
 RCM_ICON_SELECTOR = "a[id*='pesqAvancadaDatableRcmIcon']"
 FI_ICON_SELECTOR = "a[id*='pesqAvancadaDatableFiIcon']"
 MMR_ICON_SELECTOR = "a[id*='pesqAvancadaDatableMmrIcon']"
+DRUG_NAME_INPUT_SELECTOR = "input[id='mainForm:nomeMedicamento']"
 
 CSV_FIELDNAMES = [
     "id_key",
@@ -93,7 +94,7 @@ CSV_FIELDNAMES = [
 
 
 def init_db(db_path: str = DB_PATH, auto_migrate: bool = True) -> None:
-    """Initialize SQLite database with schema and auto-migrate JSON if needed.
+    """Initialize SQLite database with schema and auto-migrate legacy JSON files.
 
     Args:
         db_path: Path to SQLite database file.
@@ -132,17 +133,26 @@ def init_db(db_path: str = DB_PATH, auto_migrate: bool = True) -> None:
             );
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS atc_progress (
+                atc_code TEXT PRIMARY KEY,
+                atc_label TEXT,
+                processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
         conn.commit()
 
-        # Check if table is empty and JSON exists for auto-migration
         cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM medicamentos")
-        count = cursor.fetchone()[0]
 
+        # 1. Auto-migrate medicamentos.json if table is empty
+        cursor.execute("SELECT COUNT(*) FROM medicamentos")
+        med_count = cursor.fetchone()[0]
         if (
             auto_migrate
             and db_path == DB_PATH
-            and count == 0
+            and med_count == 0
             and os.path.exists(MEDICAMENTOS_JSON)
         ):
             try:
@@ -156,6 +166,76 @@ def init_db(db_path: str = DB_PATH, auto_migrate: bool = True) -> None:
                     upsert_medicamentos_batch(json_records, db_path=db_path)
             except Exception as err:
                 logger.warning(f"Failed to auto-migrate JSON to SQLite: {err}")
+
+        # 2. Auto-migrate atc_progress.json if atc_progress table is empty
+        cursor.execute("SELECT COUNT(*) FROM atc_progress")
+        atc_count = cursor.fetchone()[0]
+        if (
+            auto_migrate
+            and db_path == DB_PATH
+            and atc_count == 0
+            and os.path.exists(PROGRESS_FILE)
+        ):
+            try:
+                with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    saved_atcs = data.get("processed_atcs", [])
+                if saved_atcs:
+                    logger.info(
+                        f"Auto-migrating {len(saved_atcs)} processed ATCs from "
+                        f"JSON into SQLite '{db_path}'..."
+                    )
+                    for code in saved_atcs:
+                        cursor.execute(
+                            "INSERT OR IGNORE INTO atc_progress (atc_code, atc_label) "
+                            "VALUES (?, ?)",
+                            (code, code),
+                        )
+                    conn.commit()
+            except Exception as err:
+                logger.warning(f"Failed to auto-migrate ATC progress: {err}")
+
+
+def load_atc_progress_from_db(db_path: str = DB_PATH) -> Set[str]:
+    """Load the set of processed ATC codes from SQLite.
+
+    Args:
+        db_path: Path to SQLite database file.
+
+    Returns:
+        Set of processed ATC codes.
+
+    """
+    if not os.path.exists(db_path):
+        return set()
+    with sqlite3.connect(db_path, timeout=30.0) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT atc_code FROM atc_progress")
+        return {row[0] for row in cursor.fetchall()}
+
+
+def mark_atc_processed_in_db(
+    atc_code: str,
+    atc_label: str = "",
+    db_path: str = DB_PATH,
+) -> None:
+    """Record an ATC category as processed in SQLite.
+
+    Args:
+        atc_code: The ATC category identifier value.
+        atc_label: Optional label description.
+        db_path: Path to SQLite database file.
+
+    """
+    with sqlite3.connect(db_path, timeout=30.0) as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO atc_progress (atc_code, atc_label, processed_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            """,
+            (atc_code, atc_label),
+        )
+        conn.commit()
 
 
 def upsert_medicamentos_batch(
@@ -181,8 +261,8 @@ def upsert_medicamentos_batch(
 
             # Query existing record to merge ATC codes and labels
             cursor.execute(
-                "SELECT atc_codes, atc_labels, rcm_downloaded, fi_downloaded "
-                "FROM medicamentos WHERE id_key = ?",
+                "SELECT atc_codes, atc_labels, rcm_downloaded, fi_downloaded, "
+                "mmr_downloaded FROM medicamentos WHERE id_key = ?",
                 (id_key,),
             )
             row = cursor.fetchone()
@@ -204,6 +284,7 @@ def upsert_medicamentos_batch(
                         atc_labels.append(lbl)
                 rcm_downloaded = 1 if (row[2] or rcm_downloaded) else 0
                 fi_downloaded = 1 if (row[3] or fi_downloaded) else 0
+                mmr_downloaded = 1 if (row[4] or mmr_downloaded) else 0
 
             cursor.execute(
                 """
@@ -416,53 +497,6 @@ def sanitize_filename(name: str) -> str:
     return clean or "document"
 
 
-def load_progress() -> Dict[str, Any]:
-    """Load previously processed ATC codes and downloaded files.
-
-    Returns:
-        Dict containing sets of processed ATCs and downloaded files.
-
-    """
-    if os.path.exists(PROGRESS_FILE):
-        try:
-            with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return {
-                    "processed_atcs": set(data.get("processed_atcs", [])),
-                    "downloaded_files": set(data.get("downloaded_files", [])),
-                }
-        except Exception as err:
-            logger.warning(f"Failed to load progress file: {err}")
-    return {"processed_atcs": set(), "downloaded_files": set()}
-
-
-def save_progress(
-    processed_atcs: Set[str],
-    downloaded_files: Optional[Set[str]] = None,
-) -> None:
-    """Save current execution progress to file.
-
-    Args:
-        processed_atcs: Set of ATC category values already processed.
-        downloaded_files: Set of downloaded file names.
-
-    """
-    if downloaded_files is None:
-        downloaded_files = set()
-    try:
-        with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "processed_atcs": sorted(list(processed_atcs)),
-                    "downloaded_files": sorted(list(downloaded_files)),
-                },
-                f,
-                indent=2,
-            )
-    except Exception as err:
-        logger.error(f"Failed to save progress: {err}")
-
-
 def extract_atc_categories(page: Page) -> List[Dict[str, str]]:
     """Extract all available ATC categories from the PrimeFaces select dropdown.
 
@@ -508,6 +542,7 @@ def download_single_document(
     target_filepath: str,
     page: Page,
     doc_type: str = "Document",
+    timeout_ms: int = 15000,
 ) -> bool:
     """Download and validate document if not already cached and valid on disk.
 
@@ -516,6 +551,7 @@ def download_single_document(
         target_filepath: Destination file path on local disk.
         page: Playwright Page instance.
         doc_type: Human-readable document type label for logging.
+        timeout_ms: Download wait timeout in milliseconds.
 
     Returns:
         True if download succeeded and passed integrity check, False otherwise.
@@ -525,7 +561,7 @@ def download_single_document(
         return True
 
     try:
-        with page.expect_download(timeout=10000) as download_info:
+        with page.expect_download(timeout=timeout_ms) as download_info:
             icon_locator.first.click()
         download = download_info.value
         download.save_as(target_filepath)
@@ -777,6 +813,154 @@ def process_atc_category(
     return extracted_records
 
 
+def retry_missing_documents(
+    page: Page,
+    target_url: str,
+    db_path: str = DB_PATH,
+    download_dir_rcms: str = DOWNLOAD_DIR_RCMS,
+    download_dir_leaflets: str = DOWNLOAD_DIR_LEAFLETS,
+    download_dir_mmr: str = DOWNLOAD_DIR_MMR,
+) -> Tuple[int, int]:
+    """Execute Stage 2: Target and retry downloading all missing published documents.
+
+    Args:
+        page: Playwright Page instance.
+        target_url: URL of the search page.
+        db_path: Path to SQLite database.
+        download_dir_rcms: RCM directory.
+        download_dir_leaflets: Leaflet directory.
+        download_dir_mmr: MMR directory.
+
+    Returns:
+        Tuple of (recovered_rcms_count, recovered_leaflets_count).
+
+    """
+    logger.info("Starting Stage 2: Targeted Document Reconciliation Pass...")
+    recovered_rcms = 0
+    recovered_fis = 0
+
+    with sqlite3.connect(db_path, timeout=30.0) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT id_key, med_id, drug_name, has_rcm, rcm_filename,
+                   rcm_downloaded, has_fi, fi_filename, fi_downloaded,
+                   has_mmr, mmr_filename, mmr_downloaded
+            FROM medicamentos
+            WHERE (has_rcm = 1 AND rcm_downloaded = 0)
+               OR (has_fi = 1 AND fi_downloaded = 0)
+               OR (has_mmr = 1 AND mmr_downloaded = 0)
+            """
+        )
+        missing_records = [dict(row) for row in cursor.fetchall()]
+
+    if not missing_records:
+        logger.info("Stage 2: No missing published documents to retry. 100% complete!")
+        return 0, 0
+
+    logger.info(
+        f"Stage 2: Found {len(missing_records)} records with missing "
+        "documents to retry."
+    )
+
+    for item in missing_records:
+        id_key = item["id_key"]
+        med_id = item.get("med_id", "")
+        drug_name = item.get("drug_name", "")
+        search_term = drug_name.strip() if drug_name else med_id.strip()
+
+        if not search_term:
+            continue
+
+        logger.info(f"Retrying missing documents for '{drug_name}' (ID: {med_id})...")
+
+        try:
+            page.goto(target_url, wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_selector(
+                SEARCH_BUTTON_SELECTOR, state="visible", timeout=15000
+            )
+
+            # Clear inputs and fill search term
+            name_input = page.locator(DRUG_NAME_INPUT_SELECTOR)
+            if name_input.is_visible():
+                name_input.fill(search_term)
+
+            page.locator(SEARCH_BUTTON_SELECTOR).click(timeout=10000)
+            page.wait_for_selector(
+                RESULTS_TABLE_SELECTOR, state="visible", timeout=15000
+            )
+            page.wait_for_timeout(1000)
+
+            rows = page.locator(f"{TABLE_BODY_SELECTOR} tr").all()
+            for row in rows:
+                cells = [
+                    c.inner_text().strip().replace("\n", " ")
+                    for c in row.locator("td").all()
+                ]
+                row_med_id = cells[0] if len(cells) > 0 else ""
+                row_drug_name = cells[1] if len(cells) > 1 else ""
+
+                if (med_id and row_med_id == med_id) or (
+                    drug_name and row_drug_name == drug_name
+                ):
+                    # 1. Retry RCM if needed
+                    if item.get("has_rcm") and not item.get("rcm_downloaded"):
+                        rcm_icon = row.locator(RCM_ICON_SELECTOR)
+                        if rcm_icon.count() > 0:
+                            clean_id = sanitize_filename(id_key)
+                            rcm_file = item["rcm_filename"] or f"{clean_id}.pdf"
+                            target_path = os.path.join(download_dir_rcms, rcm_file)
+                            if download_single_document(
+                                rcm_icon,
+                                target_path,
+                                page,
+                                doc_type="RCM",
+                                timeout_ms=20000,
+                            ):
+                                recovered_rcms += 1
+                                with sqlite3.connect(db_path, timeout=30.0) as conn:
+                                    conn.execute(
+                                        "UPDATE medicamentos SET rcm_downloaded = 1, "
+                                        "rcm_verified = 1 WHERE id_key = ?",
+                                        (id_key,),
+                                    )
+                                    conn.commit()
+
+                    # 2. Retry Leaflet (FI) if needed
+                    if item.get("has_fi") and not item.get("fi_downloaded"):
+                        fi_icon = row.locator(FI_ICON_SELECTOR)
+                        if fi_icon.count() > 0:
+                            clean_id = sanitize_filename(id_key)
+                            fi_file = item["fi_filename"] or f"{clean_id}_FI.pdf"
+                            target_path = os.path.join(download_dir_leaflets, fi_file)
+                            if download_single_document(
+                                fi_icon,
+                                target_path,
+                                page,
+                                doc_type="Leaflet",
+                                timeout_ms=20000,
+                            ):
+                                recovered_fis += 1
+                                with sqlite3.connect(db_path, timeout=30.0) as conn:
+                                    conn.execute(
+                                        "UPDATE medicamentos SET fi_downloaded = 1, "
+                                        "fi_verified = 1 WHERE id_key = ?",
+                                        (id_key,),
+                                    )
+                                    conn.commit()
+                    break
+
+        except Exception as err:
+            logger.warning(f"Error during Stage 2 retry for '{id_key}': {err}")
+
+    logger.info(
+        f"Stage 2 completed: Recovered {recovered_rcms} RCMs and "
+        f"{recovered_fis} Leaflets."
+    )
+    return recovered_rcms, recovered_fis
+
+
 def audit_documents_and_integrity(
     medicines: Dict[str, Dict[str, Any]],
     download_dir_rcms: str = DOWNLOAD_DIR_RCMS,
@@ -890,7 +1074,7 @@ def retrieve_infomed_rcms(
     headless: bool = True,
     db_path: str = DB_PATH,
 ) -> Dict[str, Any]:
-    """Retrieve all RCMs, Leaflets, and metadata into SQLite with context recycling.
+    """Retrieve all RCMs, Leaflets, and metadata into SQLite with Stage 2 retry.
 
     Args:
         headless: Whether to run Playwright in headless mode.
@@ -902,9 +1086,8 @@ def retrieve_infomed_rcms(
     """
     init_db(db_path=db_path)
 
-    progress = load_progress()
-    processed_atcs: Set[str] = progress["processed_atcs"]
-    downloaded_files: Set[str] = progress.get("downloaded_files", set())
+    processed_atcs: Set[str] = load_atc_progress_from_db(db_path=db_path)
+    downloaded_files: Set[str] = set()
 
     for d in (DOWNLOAD_DIR_RCMS, DOWNLOAD_DIR_LEAFLETS, DOWNLOAD_DIR_MMR):
         if os.path.exists(d):
@@ -914,7 +1097,7 @@ def retrieve_infomed_rcms(
 
     existing_db_meds = load_all_medicamentos_from_db(db_path=db_path)
     logger.info(
-        f"Starting pipeline with SQLite persistence: {len(processed_atcs)} "
+        f"Starting pipeline with unified SQLite: {len(processed_atcs)} "
         f"ATCs completed, {len(existing_db_meds)} drugs in DB, "
         f"{len(downloaded_files)} PDFs saved."
     )
@@ -925,6 +1108,7 @@ def retrieve_infomed_rcms(
 
         atc_count_in_session = 0
 
+        # Stage 1: Traverse all ATC categories
         for atc in atc_categories:
             atc_val = atc["value"]
             if atc_val in processed_atcs:
@@ -987,8 +1171,8 @@ def retrieve_infomed_rcms(
                     upsert_medicamentos_batch(records, db_path=db_path)
 
                 processed_atcs.add(atc_val)
+                mark_atc_processed_in_db(atc_val, atc.get("label", ""), db_path=db_path)
                 atc_count_in_session += 1
-                save_progress(processed_atcs, downloaded_files)
 
             except Exception as err:
                 logger.error(f"Error processing ATC '{atc_val}': {err}")
@@ -1016,6 +1200,16 @@ def retrieve_infomed_rcms(
                         )
                     except Exception as page_err:
                         logger.error(f"Failed to re-initialize page: {page_err}")
+
+        # Stage 2: Targeted Document Reconciliation Pass
+        retry_missing_documents(
+            page,
+            TARGET_URL,
+            db_path=db_path,
+            download_dir_rcms=DOWNLOAD_DIR_RCMS,
+            download_dir_leaflets=DOWNLOAD_DIR_LEAFLETS,
+            download_dir_mmr=DOWNLOAD_DIR_MMR,
+        )
 
         try:
             page.close()
