@@ -26,7 +26,6 @@ logger = logging.getLogger("infomed")
 
 TARGET_URL = "https://extranet.infarmed.pt/INFOMED-fo/pesquisa-avancada.xhtml"
 PROGRESS_FILE = "atc_progress.json"
-OUTPUT_FILE = "rcm_links.txt"
 MEDICAMENTOS_JSON = "medicamentos.json"
 MEDICAMENTOS_CSV = "medicamentos.csv"
 AUDIT_REPORT_FILE = "audit_report.json"
@@ -115,10 +114,10 @@ def sanitize_filename(name: str) -> str:
 
 
 def load_progress() -> Dict[str, Any]:
-    """Load previously processed ATC codes, extracted URLs, and downloaded files.
+    """Load previously processed ATC codes and downloaded files.
 
     Returns:
-        Dict containing sets of processed ATCs, URLs, and downloaded files.
+        Dict containing sets of processed ATCs and downloaded files.
 
     """
     if os.path.exists(PROGRESS_FILE):
@@ -127,24 +126,21 @@ def load_progress() -> Dict[str, Any]:
                 data = json.load(f)
                 return {
                     "processed_atcs": set(data.get("processed_atcs", [])),
-                    "urls": set(data.get("urls", [])),
                     "downloaded_files": set(data.get("downloaded_files", [])),
                 }
         except Exception as err:
             logger.warning(f"Failed to load progress file: {err}")
-    return {"processed_atcs": set(), "urls": set(), "downloaded_files": set()}
+    return {"processed_atcs": set(), "downloaded_files": set()}
 
 
 def save_progress(
     processed_atcs: Set[str],
-    urls: Set[str],
     downloaded_files: Optional[Set[str]] = None,
 ) -> None:
     """Save current execution progress to file.
 
     Args:
         processed_atcs: Set of ATC category values already processed.
-        urls: Set of all extracted document URLs.
         downloaded_files: Set of downloaded file names.
 
     """
@@ -155,7 +151,6 @@ def save_progress(
             json.dump(
                 {
                     "processed_atcs": sorted(list(processed_atcs)),
-                    "urls": sorted(list(urls)),
                     "downloaded_files": sorted(list(downloaded_files)),
                 },
                 f,
@@ -176,7 +171,15 @@ def load_medicamentos() -> Dict[str, Dict[str, Any]]:
         try:
             with open(MEDICAMENTOS_JSON, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                return {item["id_key"]: item for item in data if "id_key" in item}
+                # Remove deprecated url fields if present in older files
+                cleaned = {}
+                for item in data:
+                    if "id_key" in item:
+                        item.pop("rcm_url", None)
+                        item.pop("fi_url", None)
+                        item.pop("mmr_url", None)
+                        cleaned[item["id_key"]] = item
+                return cleaned
         except Exception as err:
             logger.warning(f"Failed to load existing medicamentos file: {err}")
     return {}
@@ -219,24 +222,21 @@ def save_dataset(
         "atc_labels",
         "has_rcm",
         "rcm_filename",
-        "rcm_url",
         "rcm_downloaded",
         "rcm_verified",
         "has_fi",
         "fi_filename",
-        "fi_url",
         "fi_downloaded",
         "fi_verified",
         "has_mmr",
         "mmr_filename",
-        "mmr_url",
         "mmr_downloaded",
         "mmr_verified",
     ]
 
     try:
         with open(csv_path, "w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
             for r in records:
                 row = dict(r)
@@ -247,22 +247,6 @@ def save_dataset(
                 writer.writerow(row)
     except Exception as err:
         logger.error(f"Failed to save CSV dataset: {err}")
-
-
-def save_output_urls(urls: Set[str]) -> None:
-    """Write extracted document URLs to target output file.
-
-    Args:
-        urls: Set of unique document URLs.
-
-    """
-    try:
-        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-            for url in sorted(urls):
-                f.write(f"{url}\n")
-        logger.info(f"Saved {len(urls)} unique document URLs to '{OUTPUT_FILE}'.")
-    except Exception as err:
-        logger.error(f"Failed to save output URLs to file: {err}")
 
 
 def extract_atc_categories(page: Page) -> List[Dict[str, str]]:
@@ -412,14 +396,13 @@ def extract_medicine_row(
 
     # 1. Handle RCM Document
     rcm_filename: Optional[str] = None
-    rcm_url: Optional[str] = None
     rcm_downloaded = False
     rcm_verified = False
 
     if has_rcm:
         rcm_filename = f"{base_name}.pdf"
         target_rcm_path = os.path.join(download_dir_rcms, rcm_filename)
-        rcm_downloaded, rcm_url = download_single_document(
+        rcm_downloaded, _ = download_single_document(
             icon_locator=rcm_icon,
             target_filepath=target_rcm_path,
             page=page,
@@ -431,14 +414,13 @@ def extract_medicine_row(
 
     # 2. Handle Leaflet (FI) Document
     fi_filename: Optional[str] = None
-    fi_url: Optional[str] = None
     fi_downloaded = False
     fi_verified = False
 
     if has_fi:
         fi_filename = f"{base_name}_FI.pdf"
         target_fi_path = os.path.join(download_dir_leaflets, fi_filename)
-        fi_downloaded, fi_url = download_single_document(
+        fi_downloaded, _ = download_single_document(
             icon_locator=fi_icon,
             target_filepath=target_fi_path,
             page=page,
@@ -450,14 +432,13 @@ def extract_medicine_row(
 
     # 3. Handle MMR Document
     mmr_filename: Optional[str] = None
-    mmr_url: Optional[str] = None
     mmr_downloaded = False
     mmr_verified = False
 
     if has_mmr:
         mmr_filename = f"{base_name}_MMR.pdf"
         target_mmr_path = os.path.join(download_dir_mmr, mmr_filename)
-        mmr_downloaded, mmr_url = download_single_document(
+        mmr_downloaded, _ = download_single_document(
             icon_locator=mmr_icon,
             target_filepath=target_mmr_path,
             page=page,
@@ -483,17 +464,14 @@ def extract_medicine_row(
         "atc_labels": [atc["label"]] if atc.get("label") else [],
         "has_rcm": has_rcm,
         "rcm_filename": rcm_filename,
-        "rcm_url": rcm_url,
         "rcm_downloaded": rcm_downloaded,
         "rcm_verified": rcm_verified,
         "has_fi": has_fi,
         "fi_filename": fi_filename,
-        "fi_url": fi_url,
         "fi_downloaded": fi_downloaded,
         "fi_verified": fi_verified,
         "has_mmr": has_mmr,
         "mmr_filename": mmr_filename,
-        "mmr_url": mmr_url,
         "mmr_downloaded": mmr_downloaded,
         "mmr_verified": mmr_verified,
     }
@@ -685,7 +663,6 @@ def retrieve_infomed_rcms(headless: bool = True) -> Dict[str, Any]:
     """
     progress = load_progress()
     processed_atcs: Set[str] = progress["processed_atcs"]
-    all_doc_urls: Set[str] = progress["urls"]
     downloaded_files: Set[str] = progress.get("downloaded_files", set())
 
     # Pre-populate downloaded_files with existing valid PDFs across folders
@@ -738,10 +715,6 @@ def retrieve_infomed_rcms(headless: bool = True) -> Dict[str, Any]:
                         for lbl in r.get("atc_labels", []):
                             if lbl not in existing.setdefault("atc_labels", []):
                                 existing["atc_labels"].append(lbl)
-                        for url_key in ("rcm_url", "fi_url", "mmr_url"):
-                            if r.get(url_key):
-                                existing[url_key] = r[url_key]
-                                all_doc_urls.add(r[url_key])
                         for flag_key, ver_key in (
                             ("rcm_downloaded", "rcm_verified"),
                             ("fi_downloaded", "fi_verified"),
@@ -752,12 +725,9 @@ def retrieve_infomed_rcms(headless: bool = True) -> Dict[str, Any]:
                                 existing[ver_key] = True
                     else:
                         medicines_dict[k] = r
-                        for url_key in ("rcm_url", "fi_url", "mmr_url"):
-                            if r.get(url_key):
-                                all_doc_urls.add(r[url_key])
 
                 processed_atcs.add(atc_val)
-                save_progress(processed_atcs, all_doc_urls, downloaded_files)
+                save_progress(processed_atcs, downloaded_files)
                 save_dataset(medicines_dict)
 
             except Exception as err:
@@ -786,7 +756,6 @@ def retrieve_infomed_rcms(headless: bool = True) -> Dict[str, Any]:
 
         browser.close()
 
-    save_output_urls(all_doc_urls)
     save_dataset(medicines_dict)
     audit = audit_documents_and_integrity(
         medicines_dict,

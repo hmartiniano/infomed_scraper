@@ -8,7 +8,6 @@ from infomed.main import (
     load_progress,
     sanitize_filename,
     save_dataset,
-    save_output_urls,
     save_progress,
     validate_pdf,
 )
@@ -72,17 +71,12 @@ def test_progress_save_and_load(tmp_path, monkeypatch):
     monkeypatch.setattr("infomed.main.PROGRESS_FILE", test_progress_file)
 
     atcs = {"REF_ATC_1", "REF_ATC_2"}
-    urls = {
-        "https://extranet.infarmed.pt/doc1.pdf",
-        "https://extranet.infarmed.pt/doc2.pdf",
-    }
     downloaded_files = {"rcm_100.pdf", "leaflet_101.pdf"}
 
-    save_progress(atcs, urls, downloaded_files)
+    save_progress(atcs, downloaded_files)
 
     loaded = load_progress()
     assert loaded["processed_atcs"] == atcs
-    assert loaded["urls"] == urls
     assert loaded["downloaded_files"] == downloaded_files
 
 
@@ -108,17 +102,14 @@ def test_save_and_load_medicamentos(tmp_path, monkeypatch):
             "atc_labels": ["A10BB12 - glimepiride"],
             "has_rcm": True,
             "rcm_filename": "599044_Glimepirida.pdf",
-            "rcm_url": "https://example.com/rcm.pdf",
             "rcm_downloaded": True,
             "rcm_verified": True,
             "has_fi": True,
             "fi_filename": "599044_Glimepirida_FI.pdf",
-            "fi_url": "https://example.com/fi.pdf",
             "fi_downloaded": True,
             "fi_verified": True,
             "has_mmr": False,
             "mmr_filename": None,
-            "mmr_url": None,
             "mmr_downloaded": False,
             "mmr_verified": False,
         }
@@ -133,6 +124,7 @@ def test_save_and_load_medicamentos(tmp_path, monkeypatch):
     assert "599044_Glimepirida" in loaded
     assert loaded["599044_Glimepirida"]["has_fi"] is True
     assert loaded["599044_Glimepirida"]["fi_filename"] == "599044_Glimepirida_FI.pdf"
+    assert "rcm_url" not in loaded["599044_Glimepirida"]
 
 
 def test_audit_documents_and_integrity(tmp_path, monkeypatch):
@@ -197,17 +189,3 @@ def test_audit_documents_and_integrity(tmp_path, monkeypatch):
     assert audit["total_pdfs_on_disk_all_folders"] == 2
     assert audit["total_intact_pdfs_all_folders"] == 1
     assert audit["total_corrupted_pdfs_all_folders"] == 1
-
-
-def test_save_output_urls(tmp_path, monkeypatch):
-    """Test saving output URLs to text file."""
-    test_output_file = str(tmp_path / "test_urls.txt")
-    monkeypatch.setattr("infomed.main.OUTPUT_FILE", test_output_file)
-
-    urls = {"http://example.com/rcm1.pdf", "http://example.com/fi1.pdf"}
-    save_output_urls(urls)
-
-    with open(test_output_file, "r", encoding="utf-8") as f:
-        lines = [line.strip() for line in f.readlines()]
-
-    assert sorted(lines) == sorted(list(urls))
