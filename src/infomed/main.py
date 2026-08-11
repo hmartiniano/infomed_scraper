@@ -65,7 +65,8 @@ DISABLED_NEXT_PAGE_SELECTOR = "a.ui-paginator-next.ui-state-disabled"
 RCM_ICON_SELECTOR = "a[id*='pesqAvancadaDatableRcmIcon']"
 FI_ICON_SELECTOR = "a[id*='pesqAvancadaDatableFiIcon']"
 MMR_ICON_SELECTOR = "a[id*='pesqAvancadaDatableMmrIcon']"
-DRUG_NAME_INPUT_SELECTOR = "input[id='mainForm:nomeMedicamento']"
+DRUG_NAME_INPUT_SELECTOR = "input[id='mainForm:medicamento_input']"
+REG_NUMBER_INPUT_SELECTOR = "input[id='mainForm:numero-registro']"
 
 CSV_FIELDNAMES = [
     "id_key",
@@ -452,15 +453,26 @@ def validate_pdf(filepath: str) -> bool:
     try:
         with open(filepath, "rb") as f:
             header = f.read(1024)
-            if b"%PDF-" not in header:
-                logger.warning(f"PDF file '{filepath}' is missing '%PDF-' header.")
+            # Standard PDF magic bytes
+            is_pdf = b"%PDF-" in header
+            # Microsoft Word OLE2 Compound Document magic bytes (INFARMED legacy files)
+            is_doc = header.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
+
+            if not is_pdf and not is_doc:
+                logger.warning(
+                    f"File '{filepath}' is missing '%PDF-' or OLE doc header."
+                )
                 return False
 
-            f.seek(max(0, file_size - 1024))
-            trailer = f.read()
-            if b"%%EOF" not in trailer:
-                logger.warning(f"PDF file '{filepath}' is missing '%%EOF' trailer.")
-                return False
+            if is_pdf:
+                f.seek(max(0, file_size - 1024))
+                trailer = f.read()
+                if b"%%EOF" not in trailer:
+                    logger.warning(f"PDF file '{filepath}' is missing '%%EOF' trailer.")
+                    return False
+            elif is_doc:
+                # OLE2 Word doc is valid binary if size > 1024 bytes
+                return True
     except Exception as err:
         logger.warning(f"Failed to read PDF file '{filepath}': {err}")
         return False
@@ -882,10 +894,14 @@ def retry_missing_documents(
                 SEARCH_BUTTON_SELECTOR, state="visible", timeout=15000
             )
 
-            # Clear inputs and fill search term
+            # Fill registration number or drug name input
+            reg_input = page.locator(REG_NUMBER_INPUT_SELECTOR)
             name_input = page.locator(DRUG_NAME_INPUT_SELECTOR)
-            if name_input.is_visible():
-                name_input.fill(search_term)
+
+            if med_id and reg_input.is_visible():
+                reg_input.fill(med_id.strip())
+            elif drug_name and name_input.is_visible():
+                name_input.fill(drug_name.strip())
 
             page.locator(SEARCH_BUTTON_SELECTOR).click(timeout=10000)
             page.wait_for_selector(
