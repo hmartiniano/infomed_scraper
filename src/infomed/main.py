@@ -146,9 +146,10 @@ def select_atc_option(page: Page, atc_value: str) -> None:
         atc_value: The option value string (e.g., 'REF_CLASS_ATC:A01A').
 
     """
+    page.wait_for_selector(ATC_DROPDOWN_SELECTOR, state="attached", timeout=10000)
     try:
         # Standard select attempt
-        page.select_option(ATC_DROPDOWN_SELECTOR, atc_value)
+        page.select_option(ATC_DROPDOWN_SELECTOR, atc_value, timeout=5000)
     except Exception:
         # Fallback to PrimeFaces client-side API call
         page.evaluate(
@@ -187,15 +188,18 @@ def process_atc_category(
 
     found_links: List[str] = []
 
+    # Ensure search form is ready
+    page.wait_for_selector(SEARCH_BUTTON_SELECTOR, state="visible", timeout=15000)
+
     # Select ATC value
     select_atc_option(page, cat_value)
 
     # Click search button
-    page.locator(SEARCH_BUTTON_SELECTOR).click()
+    page.locator(SEARCH_BUTTON_SELECTOR).click(timeout=10000)
 
     # Wait for results table to load
-    page.wait_for_selector(RESULTS_TABLE_SELECTOR, state="visible")
-    page.wait_for_timeout(1500)
+    page.wait_for_selector(RESULTS_TABLE_SELECTOR, state="visible", timeout=15000)
+    page.wait_for_timeout(1000)
 
     os.makedirs(download_dir, exist_ok=True)
 
@@ -257,13 +261,14 @@ def process_atc_category(
         if next_button.is_visible() and not disabled_next.is_visible():
             page_num += 1
             # Click next page and wait for AJAX update
-            next_button.click()
-            page.wait_for_timeout(1500)
+            next_button.click(timeout=10000)
+            page.wait_for_timeout(1000)
         else:
             break
 
     # Reload page to reset form state for next iteration
-    page.goto(target_url)
+    page.goto(target_url, wait_until="domcontentloaded", timeout=20000)
+    page.wait_for_selector(SEARCH_BUTTON_SELECTOR, state="visible", timeout=15000)
     return found_links
 
 
@@ -291,10 +296,10 @@ def retrieve_infomed_rcms(headless: bool = True) -> Set[str]:
         browser = p.chromium.launch(headless=headless)
         context = browser.new_context(accept_downloads=True)
         page = context.new_page()
-        page.set_default_timeout(60000)
+        page.set_default_timeout(15000)
 
         logger.info(f"Opening target URL: {TARGET_URL}")
-        page.goto(TARGET_URL)
+        page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
 
         atc_categories = extract_atc_categories(page)
 
@@ -315,11 +320,28 @@ def retrieve_infomed_rcms(headless: bool = True) -> Set[str]:
                 save_progress(processed_atcs, all_rcm_urls, downloaded_files)
             except Exception as err:
                 logger.error(f"Error processing ATC '{atc_val}': {err}")
-                # Reset ViewState by reloading page
+                # Reset ViewState by reloading page with clean session recovery
                 try:
-                    page.goto(TARGET_URL)
+                    page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=20000)
+                    page.wait_for_selector(
+                        SEARCH_BUTTON_SELECTOR, state="visible", timeout=15000
+                    )
                 except Exception as reload_err:
-                    logger.error(f"Failed to reload page: {reload_err}")
+                    logger.error(
+                        f"Failed to reload page: {reload_err}. Reopening fresh page..."
+                    )
+                    try:
+                        page.close()
+                        page = context.new_page()
+                        page.set_default_timeout(15000)
+                        page.goto(
+                            TARGET_URL, wait_until="domcontentloaded", timeout=20000
+                        )
+                        page.wait_for_selector(
+                            SEARCH_BUTTON_SELECTOR, state="visible", timeout=15000
+                        )
+                    except Exception as page_err:
+                        logger.error(f"Failed to re-initialize page: {page_err}")
 
         browser.close()
 
