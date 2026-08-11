@@ -1,14 +1,19 @@
-# Infomed RCM Scraper
+# Infomed RCM, Patient Leaflet & Drug Data Scraper
 
-A robust Python browser automation tool built with Playwright and `uv` to scrape and download Resumo das Características do Medicamento (RCM) documents from the INFOMED JSF extranet portal.
+A robust Python browser automation tool built with Playwright and `uv` to scrape comprehensive medicine metadata, Resumo das Características do Medicamento (RCM / SmPC) documents, and Folhetos Informativos (FI / Patient Leaflets) from the INFOMED JSF extranet portal.
 
 ## Features
-- **JSF State Handling**: Operates inside a browser environment to automatically maintain `javax.faces.ViewState` and execute dynamic PrimeFaces AJAX DOM updates.
-- **RCM Document Downloading**: Saves extracted RCM files directly into `downloads/rcms/`.
-- **Duplicate Prevention**: Automatically skips re-downloading files that have already been saved to disk or tracked in progress.
-- **Progress Persistence**: Automatically saves processed ATC codes, extracted URLs, and downloaded filenames to `atc_progress.json` to allow seamless resuming.
-- **Pagination Support**: Iterates through PrimeFaces paginator controls for multi-page search results.
-- **Error Recovery**: Handles network/ViewState timeouts by automatically resetting session state.
+- **Comprehensive Metadata Extraction**: Extracts all drug attributes including Registration / Med ID, Trade Name, Active Substance (INN/DCI), Pharmaceutical Form, Dosage / Strength, Marketing Authorization Holder (MAH), Marketed Status, Authorization Status, WHO ATC Classifications, and document flags.
+- **Structured Dataset Exports**: Automatically streams and updates both `medicamentos.json` and `medicamentos.csv`.
+- **RCM & Leaflet Document Downloading**:
+  - SmPC documents (RCM) saved directly to `downloads/rcms/`.
+  - Patient Information Leaflets (FI) saved to `downloads/leaflets/`.
+  - Risk Minimization Materials (MMR) saved to `downloads/mmr/`.
+- **Multi-Point PDF Integrity Verification**: Every downloaded file is validated against `%PDF-` header magic bytes, `%%EOF` trailer markers, size requirements, and `pdfinfo` structure checks.
+- **Completeness & Integrity Auditing**: Generates a detailed `audit_report.json` reporting total medicines, available documents on the portal, download success rates, and PDF integrity rates across all folders.
+- **Duplicate Prevention & Caching**: Automatically skips re-downloading files that already exist on disk and pass integrity verification.
+- **Progress Persistence**: Saves processed ATC codes, document URLs, and downloaded filenames to `atc_progress.json` to allow seamless resuming.
+- **JSF State & Session Error Recovery**: Handles network timeouts and JSF ViewState desynchronization by automatically resetting and re-establishing clean browser sessions.
 
 ## Setup & Prerequisites
 
@@ -29,8 +34,6 @@ To run the main scraper:
 ```bash
 uv run python -m infomed.main
 ```
-
-The scraper will save RCM documents to `downloads/rcms/`, write extracted links to `rcm_links.txt`, and track execution progress in `atc_progress.json`.
 
 ## Running Tests & Quality Checks
 
