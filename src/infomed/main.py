@@ -3,10 +3,11 @@
 This module automates the extraction of comprehensive medicine metadata,
 RCM (Resumo das Características do Medicamento / SmPC) PDFs, and FI (Folheto
 Informativo / Patient Leaflet) PDFs from the INFOMED JSF extranet portal using
-Playwright.
+Playwright with aggressive memory management and context recycling.
 """
 
 import csv
+import gc
 import json
 import logging
 import os
@@ -33,6 +34,22 @@ AUDIT_REPORT_FILE = "audit_report.json"
 DOWNLOAD_DIR_RCMS = "downloads/rcms"
 DOWNLOAD_DIR_LEAFLETS = "downloads/leaflets"
 DOWNLOAD_DIR_MMR = "downloads/mmr"
+
+# Memory optimization recycling intervals
+CONTEXT_RECYCLE_INTERVAL = 25  # Recycle Playwright context & page every 25 ATCs
+BROWSER_RECYCLE_INTERVAL = 100  # Relaunch Chromium browser every 100 ATCs
+
+# Low-memory Chromium flags to prevent GPU cache bloat and memory leaks
+CHROMIUM_LOW_MEM_ARGS = [
+    "--disable-gpu",
+    "--disable-dev-shm-usage",
+    "--no-zygote",
+    "--js-flags=--max-old-space-size=256",
+    "--disable-software-rasterizer",
+    "--disable-background-networking",
+    "--disable-default-apps",
+    "--disable-extensions",
+]
 
 # DOM Selectors for PrimeFaces JSF
 ATC_DROPDOWN_SELECTOR = "select[id='mainForm:classif-atc_input']"
@@ -171,7 +188,6 @@ def load_medicamentos() -> Dict[str, Dict[str, Any]]:
         try:
             with open(MEDICAMENTOS_JSON, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                # Remove deprecated url fields if present in older files
                 cleaned = {}
                 for item in data:
                     if "id_key" in item:
@@ -294,7 +310,7 @@ def download_single_document(
     target_filepath: str,
     page: Page,
     doc_type: str = "Document",
-) -> Tuple[bool, Optional[str]]:
+) -> bool:
     """Download and validate document if not already cached and valid on disk.
 
     Args:
@@ -304,30 +320,29 @@ def download_single_document(
         doc_type: Human-readable document type label for logging.
 
     Returns:
-        Tuple of (download_success: bool, download_url: Optional[str]).
+        True if download succeeded and passed integrity check, False otherwise.
 
     """
     if os.path.exists(target_filepath) and validate_pdf(target_filepath):
-        return True, None
+        return True
 
     try:
         with page.expect_download(timeout=10000) as download_info:
             icon_locator.first.click()
         download = download_info.value
-        doc_url = download.url or None
         download.save_as(target_filepath)
 
         if validate_pdf(target_filepath):
             logger.info(f"Downloaded & verified {doc_type}: '{target_filepath}'")
-            return True, doc_url
+            return True
         else:
             logger.warning(
                 f"Downloaded {doc_type} '{target_filepath}' failed integrity check."
             )
-            return False, doc_url
+            return False
     except Exception as err:
         logger.debug(f"Download trigger note for {doc_type} '{target_filepath}': {err}")
-        return False, None
+        return False
 
 
 def extract_medicine_row(
@@ -402,7 +417,7 @@ def extract_medicine_row(
     if has_rcm:
         rcm_filename = f"{base_name}.pdf"
         target_rcm_path = os.path.join(download_dir_rcms, rcm_filename)
-        rcm_downloaded, _ = download_single_document(
+        rcm_downloaded = download_single_document(
             icon_locator=rcm_icon,
             target_filepath=target_rcm_path,
             page=page,
@@ -420,7 +435,7 @@ def extract_medicine_row(
     if has_fi:
         fi_filename = f"{base_name}_FI.pdf"
         target_fi_path = os.path.join(download_dir_leaflets, fi_filename)
-        fi_downloaded, _ = download_single_document(
+        fi_downloaded = download_single_document(
             icon_locator=fi_icon,
             target_filepath=target_fi_path,
             page=page,
@@ -438,7 +453,7 @@ def extract_medicine_row(
     if has_mmr:
         mmr_filename = f"{base_name}_MMR.pdf"
         target_mmr_path = os.path.join(download_dir_mmr, mmr_filename)
-        mmr_downloaded, _ = download_single_document(
+        mmr_downloaded = download_single_document(
             icon_locator=mmr_icon,
             target_filepath=target_mmr_path,
             page=page,
@@ -651,8 +666,30 @@ def audit_documents_and_integrity(
     return audit_summary
 
 
+def create_browser_session(p: Any, headless: bool = True) -> Tuple[Any, Any, Page]:
+    """Launch a low-memory Chromium browser, context, and page.
+
+    Args:
+        p: Playwright instance.
+        headless: Whether to run in headless mode.
+
+    Returns:
+        Tuple of (browser, context, page).
+
+    """
+    browser = p.chromium.launch(
+        headless=headless,
+        args=CHROMIUM_LOW_MEM_ARGS,
+    )
+    context = browser.new_context(accept_downloads=True)
+    page = context.new_page()
+    page.set_default_timeout(15000)
+    page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
+    return browser, context, page
+
+
 def retrieve_infomed_rcms(headless: bool = True) -> Dict[str, Any]:
-    """Retrieve all RCM documents, Leaflets, and metadata from INFOMED extranet.
+    """Retrieve all RCMs, Leaflets, and metadata with aggressive memory recycling.
 
     Args:
         headless: Whether to run Playwright in headless mode.
@@ -679,20 +716,56 @@ def retrieve_infomed_rcms(headless: bool = True) -> Dict[str, Any]:
     )
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        context = browser.new_context(accept_downloads=True)
-        page = context.new_page()
-        page.set_default_timeout(15000)
-
-        logger.info(f"Opening target URL: {TARGET_URL}")
-        page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
-
+        browser, context, page = create_browser_session(p, headless=headless)
         atc_categories = extract_atc_categories(page)
+
+        atc_count_in_session = 0
 
         for atc in atc_categories:
             atc_val = atc["value"]
             if atc_val in processed_atcs:
                 continue
+
+            # 1. Periodic Browser Recycling (every 100 ATCs)
+            should_recycle_browser = (
+                atc_count_in_session > 0
+                and atc_count_in_session % BROWSER_RECYCLE_INTERVAL == 0
+            )
+            should_recycle_context = (
+                atc_count_in_session > 0
+                and atc_count_in_session % CONTEXT_RECYCLE_INTERVAL == 0
+            )
+
+            if should_recycle_browser:
+                logger.info(
+                    f"Recycling full browser process after {atc_count_in_session} "
+                    "ATCs to release all Chromium memory..."
+                )
+                try:
+                    page.close()
+                    context.close()
+                    browser.close()
+                except Exception:
+                    pass
+                gc.collect()
+                browser, context, page = create_browser_session(p, headless=headless)
+
+            # 2. Periodic Context Recycling (every 25 ATCs)
+            elif should_recycle_context:
+                logger.info(
+                    f"Recycling browser context after {atc_count_in_session} "
+                    "ATCs to flush download buffers..."
+                )
+                try:
+                    page.close()
+                    context.close()
+                except Exception:
+                    pass
+                gc.collect()
+                context = browser.new_context(accept_downloads=True)
+                page = context.new_page()
+                page.set_default_timeout(15000)
+                page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
 
             try:
                 records = process_atc_category(
@@ -727,6 +800,7 @@ def retrieve_infomed_rcms(headless: bool = True) -> Dict[str, Any]:
                         medicines_dict[k] = r
 
                 processed_atcs.add(atc_val)
+                atc_count_in_session += 1
                 save_progress(processed_atcs, downloaded_files)
                 save_dataset(medicines_dict)
 
@@ -743,6 +817,9 @@ def retrieve_infomed_rcms(headless: bool = True) -> Dict[str, Any]:
                     )
                     try:
                         page.close()
+                        context.close()
+                        gc.collect()
+                        context = browser.new_context(accept_downloads=True)
                         page = context.new_page()
                         page.set_default_timeout(15000)
                         page.goto(
@@ -754,7 +831,12 @@ def retrieve_infomed_rcms(headless: bool = True) -> Dict[str, Any]:
                     except Exception as page_err:
                         logger.error(f"Failed to re-initialize page: {page_err}")
 
-        browser.close()
+        try:
+            page.close()
+            context.close()
+            browser.close()
+        except Exception:
+            pass
 
     save_dataset(medicines_dict)
     audit = audit_documents_and_integrity(
