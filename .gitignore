@@ -7,3 +7,6 @@ atc_progress.json
 rcm_links.txt
 downloads/
 wget-log*
+*.db
+medicamentos.json
+medicamentos.csv
