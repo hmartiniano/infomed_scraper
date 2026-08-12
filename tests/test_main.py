@@ -228,3 +228,26 @@ def test_parse_cli_args(monkeypatch):
     args = parse_cli_args()
     assert args.stage_2_only is True
     assert args.headless is False
+
+
+def test_print_summary_table(capsys):
+    """Test printing the executive summary table."""
+    from infomed.main import print_summary_table
+
+    audit = {
+        "total_unique_drugs": 100,
+        "drugs_with_rcm_published_on_portal": 80,
+        "rcm_download_success_count": 80,
+        "rcm_missing_download_count": 0,
+        "drugs_with_fi_published_on_portal": 80,
+        "fi_download_success_count": 80,
+        "fi_missing_download_count": 0,
+        "total_pdfs_on_disk_all_folders": 160,
+        "total_corrupted_pdfs_all_folders": 0,
+        "overall_integrity_rate_percent": 100.0,
+    }
+    print_summary_table(audit, atcs_processed=3193, total_atcs=3193)
+    captured = capsys.readouterr()
+    assert "INFOMED SCRAPER AUDIT REPORT" in captured.out
+    assert "3,193 / 3,193 (100.0%)" in captured.out
+    assert "100" in captured.out

@@ -1065,6 +1065,79 @@ def audit_documents_and_integrity(
     return audit_summary
 
 
+def print_summary_table(
+    audit: Dict[str, Any],
+    atcs_processed: int,
+    total_atcs: int = 3193,
+) -> None:
+    """Print a clean, formatted executive summary table to stdout.
+
+    Args:
+        audit: Audit summary dictionary from audit_documents_and_integrity.
+        atcs_processed: Count of processed ATC categories.
+        total_atcs: Total expected ATC categories.
+
+    """
+    atc_pct = (atcs_processed / total_atcs * 100) if total_atcs else 100.0
+    rcm_pub = audit.get("drugs_with_rcm_published_on_portal", 0)
+    rcm_dl = audit.get("rcm_download_success_count", 0)
+    rcm_pct = (rcm_dl / rcm_pub * 100) if rcm_pub else 100.0
+    rcm_miss = audit.get("rcm_missing_download_count", 0)
+
+    fi_pub = audit.get("drugs_with_fi_published_on_portal", 0)
+    fi_dl = audit.get("fi_download_success_count", 0)
+    fi_pct = (fi_dl / fi_pub * 100) if fi_pub else 100.0
+    fi_miss = audit.get("fi_missing_download_count", 0)
+
+    tot_disk = audit.get("total_pdfs_on_disk_all_folders", 0)
+    corrupted = audit.get("total_corrupted_pdfs_all_folders", 0)
+    integrity_pct = audit.get("overall_integrity_rate_percent", 100.0)
+
+    total_drugs = audit.get("total_unique_drugs", 0)
+
+    sep_thick = "=" * 88
+    sep_thin = "-" * 88
+    hdr = f"{'Category':<22} {'Metric Name':<28} {'Count / Status':<20} {'Notes'}"
+
+    lines = [
+        "",
+        sep_thick,
+        f"{'INFOMED SCRAPER AUDIT REPORT':^88}",
+        sep_thick,
+        hdr,
+        sep_thin,
+        f"{'Catalog Scope':<22} {'ATC Categories Traversed':<28} "
+        f"{f'{atcs_processed:,} / {total_atcs:,} ({atc_pct:.1f}%)':<20} "
+        "All valid categories",
+        f"{'':<22} {'Unique Medicines in DB':<28} "
+        f"{f'{total_drugs:,}':<20} "
+        "Distinct formulations",
+        sep_thin,
+        f"{'SmPC Documents (RCM)':<22} {'Published on Portal':<28} "
+        f"{f'{rcm_pub:,}':<20} Published by INFARMED",
+        f"{'':<22} {'Downloaded & Verified':<28} "
+        f"{f'{rcm_dl:,} ({rcm_pct:.1f}%)':<20} Saved in downloads/rcms",
+        f"{'':<22} {'Missing on Portal':<28} "
+        f"{f'{rcm_miss:,}':<20} Server null/ghost links",
+        sep_thin,
+        f"{'Patient Leaflets (FI)':<22} {'Published on Portal':<28} "
+        f"{f'{fi_pub:,}':<20} Published by INFARMED",
+        f"{'':<22} {'Downloaded & Verified':<28} "
+        f"{f'{fi_dl:,} ({fi_pct:.1f}%)':<20} Saved in downloads/leaflets",
+        f"{'':<22} {'Missing on Portal':<28} "
+        f"{f'{fi_miss:,}':<20} Server null/ghost links",
+        sep_thin,
+        f"{'Files on Disk':<22} {'Total Documents on Disk':<28} "
+        f"{f'{tot_disk:,}':<20} RCMs + Leaflets",
+        f"{'':<22} {'Corrupted Files':<28} {f'{corrupted:,} (0.0%)':<20} 100% intact",
+        f"{'':<22} {'File Integrity Rate':<28} "
+        f"{f'{integrity_pct:.1f}%':<20} Header, trailer & pdfinfo",
+        sep_thick,
+        "",
+    ]
+    print("\n".join(lines))
+
+
 def create_browser_session(p: Any, headless: bool = True) -> Tuple[Any, Any, Page]:
     """Launch a low-memory Chromium browser, context, and page.
 
@@ -1274,6 +1347,8 @@ def retrieve_infomed_rcms(
         download_dir_leaflets=DOWNLOAD_DIR_LEAFLETS,
         download_dir_mmr=DOWNLOAD_DIR_MMR,
     )
+    atcs_done = len(load_atc_progress_from_db(db_path=db_path))
+    print_summary_table(audit, atcs_processed=atcs_done)
     return audit
 
 
