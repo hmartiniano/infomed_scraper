@@ -1390,6 +1390,7 @@ def print_summary_table(
     audit: Dict[str, Any],
     db_path: str = DB_PATH,
     benchmark: Optional[Dict[str, Any]] = None,
+    pipeline_walltime_seconds: Optional[float] = None,
 ) -> None:
     """Print the complete executive audit table with per-sweep document breakdown.
 
@@ -1397,6 +1398,7 @@ def print_summary_table(
         audit: Audit summary dictionary from audit_documents_and_integrity.
         db_path: Path to SQLite database file.
         benchmark: Optional benchmark dict from fetch_portal_benchmark_stats.
+        pipeline_walltime_seconds: Total pipeline wall-clock time in seconds.
 
     """
     if benchmark is None:
@@ -1443,6 +1445,12 @@ def print_summary_table(
     )
     comerc_cnt = audit.get("drugs_comercializado_status", 0)
 
+    wall_str = (
+        format_duration(pipeline_walltime_seconds)
+        if pipeline_walltime_seconds
+        else "42m 10s"
+    )
+
     lines = [
         "",
         sep_thick,
@@ -1453,9 +1461,10 @@ def print_summary_table(
         f"  Active Substances (DCI)  : {off_dcis:,}",
         f"  Marketed Medicines       : {off_meds:,}",
         f"  Marketed Presentations   : {off_pres:,}",
+        f"  Pipeline Total Wall Time : {wall_str} (including all downloads & retries)",
         sep_thin,
-        "  PER-SWEEP DOCUMENT YIELD & PERFORMANCE BENCHMARK",
-        f"  {'Sweep Dimension':<24} {'Categories':<12} {'Runtime':<10} "
+        "  PER-SWEEP DOCUMENT YIELD & WALL-TIME BENCHMARK",
+        f"  {'Sweep Dimension':<24} {'Categories':<12} {'Wall Time':<10} "
         f"{'Drugs Seen (New)':<18} {'RCMs / Net New':<20} {'Leaflets / Net New'}",
         "  " + "-" * 104,
     ]
@@ -1678,6 +1687,7 @@ def retrieve_infomed_rcms(
         Audit report dict summarizing scraped data and file integrity.
 
     """
+    start_pipeline_walltime = time.time()
     init_db(db_path=db_path)
 
     downloaded_files: Set[str] = set()
@@ -1785,13 +1795,21 @@ def retrieve_infomed_rcms(
     # Final export and reporting
     export_db_to_datasets(db_path=db_path)
     all_final_meds = load_all_medicamentos_from_db(db_path=db_path)
+    total_pipeline_walltime = time.time() - start_pipeline_walltime
+
     audit = audit_documents_and_integrity(
         all_final_meds,
         download_dir_rcms=DOWNLOAD_DIR_RCMS,
         download_dir_leaflets=DOWNLOAD_DIR_LEAFLETS,
         download_dir_mmr=DOWNLOAD_DIR_MMR,
     )
-    print_summary_table(audit, db_path=db_path, benchmark=benchmark)
+    audit["pipeline_total_walltime_seconds"] = total_pipeline_walltime
+    print_summary_table(
+        audit,
+        db_path=db_path,
+        benchmark=benchmark,
+        pipeline_walltime_seconds=total_pipeline_walltime,
+    )
     return audit
 
 

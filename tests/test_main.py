@@ -348,13 +348,20 @@ def test_print_summary_table(tmp_path, capsys):
         "official_marketed_presentations": 12645,
     }
 
-    print_summary_table(audit, db_path=db_path, benchmark=benchmark)
+    print_summary_table(
+        audit,
+        db_path=db_path,
+        benchmark=benchmark,
+        pipeline_walltime_seconds=2530.0,
+    )
     captured = capsys.readouterr()
 
     assert "INFOMED MASTER AUDIT & COMPARISON REPORT" in captured.out
     assert "1,692" in captured.out
     assert "10,426" in captured.out
     assert "12/08/2026" in captured.out
+    assert "Pipeline Total Wall Time" in captured.out
+    assert "42m 10s" in captured.out
     assert "1. WHO ATC Traversal" in captured.out
     assert "7,202" in captured.out
     assert "7,151" in captured.out
