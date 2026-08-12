@@ -3,8 +3,8 @@
 This module automates the extraction of comprehensive medicine metadata,
 RCM (Resumo das Características do Medicamento / SmPC) PDFs, and FI (Folheto
 Informativo / Patient Leaflet) PDFs from the INFOMED JSF extranet portal using
-Playwright with a unified ACID SQLite persistence architecture, low-memory
-context recycling, and an automated Stage 2 targeted document retry pass.
+Playwright with unified ACID SQLite persistence, multi-dimensional sweeps,
+per-sweep document yield tracking, and portal benchmark comparison.
 """
 
 import argparse
@@ -28,6 +28,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("infomed")
 
+HOMEPAGE_URL = "https://extranet.infarmed.pt/INFOMED-fo/index.xhtml"
 TARGET_URL = "https://extranet.infarmed.pt/INFOMED-fo/pesquisa-avancada.xhtml"
 PROGRESS_FILE = "atc_progress.json"
 DB_PATH = "medicamentos.db"
@@ -40,10 +41,10 @@ DOWNLOAD_DIR_LEAFLETS = "downloads/leaflets"
 DOWNLOAD_DIR_MMR = "downloads/mmr"
 
 # Memory optimization recycling intervals
-CONTEXT_RECYCLE_INTERVAL = 25  # Recycle Playwright context & page every 25 ATCs
-BROWSER_RECYCLE_INTERVAL = 100  # Relaunch Chromium browser every 100 ATCs
+CONTEXT_RECYCLE_INTERVAL = 25
+BROWSER_RECYCLE_INTERVAL = 100
 
-# Low-memory Chromium flags to prevent GPU cache bloat and memory leaks
+# Low-memory Chromium flags
 CHROMIUM_LOW_MEM_ARGS = [
     "--disable-gpu",
     "--disable-dev-shm-usage",
@@ -55,8 +56,13 @@ CHROMIUM_LOW_MEM_ARGS = [
     "--disable-extensions",
 ]
 
-# DOM Selectors for PrimeFaces JSF
+# DOM Selectors on pesquisa-avancada.xhtml
 ATC_DROPDOWN_SELECTOR = "select[id='mainForm:classif-atc_input']"
+DISPENSA_DROPDOWN_SELECTOR = "select[id='mainForm:classif-dispensa_input']"
+CFT_DROPDOWN_SELECTOR = "select[id='mainForm:classif-farmacoterapeutica_input']"
+AIM_DROPDOWN_SELECTOR = "select[id='mainForm:estado-aim_input']"
+COMERC_DROPDOWN_SELECTOR = "select[id='mainForm:estado-comercializacao_input']"
+
 SEARCH_BUTTON_SELECTOR = "button[id='mainForm:btnDoSearch']"
 RESULTS_TABLE_SELECTOR = "div[id='mainForm:dt-medicamentos']"
 TABLE_BODY_SELECTOR = "tbody[id='mainForm:dt-medicamentos_data']"
@@ -96,7 +102,7 @@ CSV_FIELDNAMES = [
 
 
 def init_db(db_path: str = DB_PATH, auto_migrate: bool = True) -> None:
-    """Initialize SQLite database with schema and auto-migrate legacy JSON files.
+    """Initialize SQLite database with schema, progress tables, and metrics.
 
     Args:
         db_path: Path to SQLite database file.
@@ -141,6 +147,57 @@ def init_db(db_path: str = DB_PATH, auto_migrate: bool = True) -> None:
                 atc_code TEXT PRIMARY KEY,
                 atc_label TEXT,
                 processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dispensa_progress (
+                dispensa_code TEXT PRIMARY KEY,
+                dispensa_label TEXT,
+                processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cft_progress (
+                cft_code TEXT PRIMARY KEY,
+                cft_label TEXT,
+                processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS aim_progress (
+                aim_code TEXT PRIMARY KEY,
+                aim_label TEXT,
+                processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS comerc_progress (
+                comerc_code TEXT PRIMARY KEY,
+                comerc_label TEXT,
+                processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sweep_metrics (
+                sweep_name TEXT PRIMARY KEY,
+                total_categories INTEGER,
+                categories_processed INTEGER,
+                medicines_encountered INTEGER,
+                rcms_available INTEGER,
+                rcms_downloaded INTEGER,
+                leaflets_available INTEGER,
+                leaflets_downloaded INTEGER,
+                last_run TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
@@ -189,8 +246,8 @@ def init_db(db_path: str = DB_PATH, auto_migrate: bool = True) -> None:
                     )
                     for code in saved_atcs:
                         cursor.execute(
-                            "INSERT OR IGNORE INTO atc_progress (atc_code, atc_label) "
-                            "VALUES (?, ?)",
+                            "INSERT OR IGNORE INTO atc_progress "
+                            "(atc_code, atc_label) VALUES (?, ?)",
                             (code, code),
                         )
                     conn.commit()
@@ -198,22 +255,136 @@ def init_db(db_path: str = DB_PATH, auto_migrate: bool = True) -> None:
                 logger.warning(f"Failed to auto-migrate ATC progress: {err}")
 
 
-def load_atc_progress_from_db(db_path: str = DB_PATH) -> Set[str]:
-    """Load the set of processed ATC codes from SQLite.
+def save_sweep_metrics(
+    sweep_name: str,
+    total_categories: int,
+    categories_processed: int,
+    medicines_encountered: int,
+    rcms_available: int,
+    rcms_downloaded: int,
+    leaflets_available: int,
+    leaflets_downloaded: int,
+    db_path: str = DB_PATH,
+) -> None:
+    """Save or update per-sweep document statistics in SQLite.
+
+    Args:
+        sweep_name: Dimension identifier (e.g. 'WHO ATC Traversal').
+        total_categories: Total categories available in this dimension.
+        categories_processed: Number of categories processed.
+        medicines_encountered: Total medicines found during this sweep.
+        rcms_available: Total RCM documents available in this sweep.
+        rcms_downloaded: Total RCM documents successfully downloaded.
+        leaflets_available: Total Leaflets available in this sweep.
+        leaflets_downloaded: Total Leaflets successfully downloaded.
+        db_path: Path to SQLite database file.
+
+    """
+    with sqlite3.connect(db_path, timeout=30.0) as conn:
+        conn.execute(
+            """
+            INSERT INTO sweep_metrics (
+                sweep_name, total_categories, categories_processed,
+                medicines_encountered, rcms_available, rcms_downloaded,
+                leaflets_available, leaflets_downloaded, last_run
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(sweep_name) DO UPDATE SET
+                total_categories = excluded.total_categories,
+                categories_processed = excluded.categories_processed,
+                medicines_encountered = excluded.medicines_encountered,
+                rcms_available = excluded.rcms_available,
+                rcms_downloaded = excluded.rcms_downloaded,
+                leaflets_available = excluded.leaflets_available,
+                leaflets_downloaded = excluded.leaflets_downloaded,
+                last_run = CURRENT_TIMESTAMP;
+            """,
+            (
+                sweep_name,
+                total_categories,
+                categories_processed,
+                medicines_encountered,
+                rcms_available,
+                rcms_downloaded,
+                leaflets_available,
+                leaflets_downloaded,
+            ),
+        )
+        conn.commit()
+
+
+def load_all_sweep_metrics(db_path: str = DB_PATH) -> List[Dict[str, Any]]:
+    """Load all recorded sweep metrics from SQLite.
 
     Args:
         db_path: Path to SQLite database file.
 
     Returns:
-        Set of processed ATC codes.
+        List of dictionaries with sweep statistics.
+
+    """
+    if not os.path.exists(db_path):
+        return []
+    with sqlite3.connect(db_path, timeout=30.0) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM sweep_metrics ORDER BY sweep_name")
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def load_progress_table(table_name: str, db_path: str = DB_PATH) -> Set[str]:
+    """Load the set of processed codes from a specific progress table.
+
+    Args:
+        table_name: Name of progress table (e.g. 'atc_progress').
+        db_path: Path to SQLite database file.
+
+    Returns:
+        Set of processed option codes.
 
     """
     if not os.path.exists(db_path):
         return set()
+    col_name = table_name.replace("_progress", "_code")
     with sqlite3.connect(db_path, timeout=30.0) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT atc_code FROM atc_progress")
-        return {row[0] for row in cursor.fetchall()}
+        try:
+            cursor.execute(f"SELECT {col_name} FROM {table_name}")
+            return {row[0] for row in cursor.fetchall()}
+        except Exception:
+            return set()
+
+
+def mark_progress_item(
+    table_name: str,
+    code: str,
+    label: str = "",
+    db_path: str = DB_PATH,
+) -> None:
+    """Record an item as processed in a specific progress table.
+
+    Args:
+        table_name: Name of progress table.
+        code: Option identifier string.
+        label: Description label.
+        db_path: Path to SQLite database file.
+
+    """
+    col_name = table_name.replace("_progress", "_code")
+    lbl_col = table_name.replace("_progress", "_label")
+    with sqlite3.connect(db_path, timeout=30.0) as conn:
+        conn.execute(
+            f"""
+            INSERT OR REPLACE INTO {table_name} ({col_name}, {lbl_col}, processed_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            """,
+            (code, label),
+        )
+        conn.commit()
+
+
+def load_atc_progress_from_db(db_path: str = DB_PATH) -> Set[str]:
+    """Load the set of processed ATC codes from SQLite."""
+    return load_progress_table("atc_progress", db_path=db_path)
 
 
 def mark_atc_processed_in_db(
@@ -221,23 +392,59 @@ def mark_atc_processed_in_db(
     atc_label: str = "",
     db_path: str = DB_PATH,
 ) -> None:
-    """Record an ATC category as processed in SQLite.
+    """Record an ATC category as processed in SQLite."""
+    mark_progress_item("atc_progress", atc_code, atc_label, db_path=db_path)
+
+
+def fetch_portal_benchmark_stats(page: Page) -> Dict[str, Any]:
+    """Extract official published totals and update date from INFOMED homepage.
 
     Args:
-        atc_code: The ATC category identifier value.
-        atc_label: Optional label description.
-        db_path: Path to SQLite database file.
+        page: Playwright Page instance.
+
+    Returns:
+        Dict with benchmark statistics from index.xhtml.
 
     """
-    with sqlite3.connect(db_path, timeout=30.0) as conn:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO atc_progress (atc_code, atc_label, processed_at)
-            VALUES (?, ?, CURRENT_TIMESTAMP)
-            """,
-            (atc_code, atc_label),
+    benchmark = {
+        "portal_url": HOMEPAGE_URL,
+        "portal_last_updated": "Unknown",
+        "official_active_substances_dci": 1692,
+        "official_marketed_medicines": 10426,
+        "official_marketed_presentations": 12645,
+    }
+    try:
+        page.goto(HOMEPAGE_URL, wait_until="domcontentloaded", timeout=20000)
+        page.wait_for_timeout(2500)  # Allow countup animations to settle
+
+        text = page.locator("body").inner_text()
+        lines = [line.strip() for line in text.split("\n") if line.strip()]
+
+        for i, line in enumerate(lines):
+            if "Atualizado a" in line and i + 1 < len(lines):
+                benchmark["portal_last_updated"] = lines[i + 1]
+            elif "Substâncias Ativas/DCI" in line and i + 1 < len(lines):
+                val = re.sub(r"\D", "", lines[i + 1])
+                if val:
+                    benchmark["official_active_substances_dci"] = int(val)
+            elif "Medicamentos*" in line and i + 1 < len(lines):
+                val = re.sub(r"\D", "", lines[i + 1])
+                if val:
+                    benchmark["official_marketed_medicines"] = int(val)
+            elif "Apresentações*" in line and i + 1 < len(lines):
+                val = re.sub(r"\D", "", lines[i + 1])
+                if val:
+                    benchmark["official_marketed_presentations"] = int(val)
+
+        logger.info(
+            f"Fetched portal benchmarks: Updated {benchmark['portal_last_updated']}, "
+            f"{benchmark['official_active_substances_dci']} DCIs, "
+            f"{benchmark['official_marketed_medicines']} Medicines."
         )
-        conn.commit()
+    except Exception as err:
+        logger.warning(f"Could not fetch homepage benchmark stats: {err}")
+
+    return benchmark
 
 
 def upsert_medicamentos_batch(
@@ -261,7 +468,6 @@ def upsert_medicamentos_batch(
         for r in records:
             id_key = r["id_key"]
 
-            # Query existing record to merge ATC codes and labels
             cursor.execute(
                 "SELECT atc_codes, atc_labels, rcm_downloaded, fi_downloaded, "
                 "mmr_downloaded FROM medicamentos WHERE id_key = ?",
@@ -358,15 +564,7 @@ def upsert_medicamentos_batch(
 def load_all_medicamentos_from_db(
     db_path: str = DB_PATH,
 ) -> Dict[str, Dict[str, Any]]:
-    """Load all records from SQLite into a dictionary keyed by id_key.
-
-    Args:
-        db_path: Path to SQLite database file.
-
-    Returns:
-        Dict mapping id_key to structured medicine dictionary.
-
-    """
+    """Load all records from SQLite into a dictionary keyed by id_key."""
     if not os.path.exists(db_path):
         return {}
 
@@ -397,14 +595,7 @@ def export_db_to_datasets(
     json_path: str = MEDICAMENTOS_JSON,
     csv_path: str = MEDICAMENTOS_CSV,
 ) -> None:
-    """Export SQLite database to JSON and CSV datasets.
-
-    Args:
-        db_path: Path to SQLite database file.
-        json_path: Target path for the JSON export.
-        csv_path: Target path for the CSV export.
-
-    """
+    """Export SQLite database to JSON and CSV datasets."""
     medicines = load_all_medicamentos_from_db(db_path=db_path)
     records = list(medicines.values())
 
@@ -433,7 +624,7 @@ def export_db_to_datasets(
 
 
 def validate_pdf(filepath: str) -> bool:
-    """Validate PDF file integrity via header, trailer, size, and pdfinfo.
+    """Validate PDF/OLE2 file integrity via header, trailer, size, and pdfinfo.
 
     Args:
         filepath: Path to the PDF file on disk.
@@ -447,15 +638,13 @@ def validate_pdf(filepath: str) -> bool:
 
     file_size = os.path.getsize(filepath)
     if file_size < 100:
-        logger.warning(f"PDF file '{filepath}' is too small ({file_size} bytes).")
+        logger.warning(f"File '{filepath}' is too small ({file_size} bytes).")
         return False
 
     try:
         with open(filepath, "rb") as f:
             header = f.read(1024)
-            # Standard PDF magic bytes
             is_pdf = b"%PDF-" in header
-            # Microsoft Word OLE2 Compound Document magic bytes (INFARMED legacy files)
             is_doc = header.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
 
             if not is_pdf and not is_doc:
@@ -471,7 +660,6 @@ def validate_pdf(filepath: str) -> bool:
                     logger.warning(f"PDF file '{filepath}' is missing '%%EOF' trailer.")
                     return False
             elif is_doc:
-                # OLE2 Word doc is valid binary if size > 1024 bytes
                 return True
     except Exception as err:
         logger.warning(f"Failed to read PDF file '{filepath}': {err}")
@@ -496,58 +684,77 @@ def validate_pdf(filepath: str) -> bool:
 
 
 def sanitize_filename(name: str) -> str:
-    """Sanitize string to create a safe cross-platform filename.
-
-    Args:
-        name: Raw input text string.
-
-    Returns:
-        Sanitized string suitable for filenames.
-
-    """
+    """Sanitize string to create a safe cross-platform filename."""
     clean = re.sub(r"[^\w\.-]", "_", name.strip())
     clean = re.sub(r"_+", "_", clean).strip("_")
     return clean or "document"
 
 
-def extract_atc_categories(page: Page) -> List[Dict[str, str]]:
-    """Extract all available ATC categories from the PrimeFaces select dropdown.
+def extract_dropdown_options(
+    page: Page, selector: str, desc: str = "options"
+) -> List[Dict[str, str]]:
+    """Extract options from a select dropdown.
 
     Args:
         page: Playwright Page instance.
+        selector: CSS selector for select element.
+        desc: Description for logging.
 
     Returns:
-        List of dicts with 'value' and 'label' for valid ATC options.
+        List of dicts with 'value' and 'label'.
 
     """
-    page.wait_for_selector(ATC_DROPDOWN_SELECTOR, state="attached", timeout=15000)
+    page.wait_for_selector(selector, state="attached", timeout=15000)
     eval_js = (
         "options => options.map(opt => "
         "({value: opt.value, label: opt.innerText.trim()}))"
     )
-    atc_options = page.locator(f"{ATC_DROPDOWN_SELECTOR} option").evaluate_all(eval_js)
-    valid_atcs = [opt for opt in atc_options if opt["value"].strip()]
-    logger.info(f"Extracted {len(valid_atcs)} ATC categories from DOM.")
-    return valid_atcs
+    opts = page.locator(f"{selector} option").evaluate_all(eval_js)
+    valid_opts = [opt for opt in opts if opt["value"].strip()]
+    logger.info(f"Extracted {len(valid_opts)} {desc} from DOM.")
+    return valid_opts
+
+
+def extract_atc_categories(page: Page) -> List[Dict[str, str]]:
+    """Extract all available ATC categories."""
+    return extract_dropdown_options(page, ATC_DROPDOWN_SELECTOR, desc="ATC categories")
+
+
+def extract_dispensa_categories(page: Page) -> List[Dict[str, str]]:
+    """Extract all Dispensa options."""
+    return extract_dropdown_options(
+        page, DISPENSA_DROPDOWN_SELECTOR, desc="Dispensa categories"
+    )
+
+
+def extract_cft_categories(page: Page) -> List[Dict[str, str]]:
+    """Extract all Farmacoterapeutica options."""
+    return extract_dropdown_options(
+        page, CFT_DROPDOWN_SELECTOR, desc="Farmacoterapeutica categories"
+    )
+
+
+def extract_aim_options(page: Page) -> List[Dict[str, str]]:
+    """Extract all Estado AIM options."""
+    return extract_dropdown_options(page, AIM_DROPDOWN_SELECTOR, desc="AIM options")
+
+
+def extract_comerc_options(page: Page) -> List[Dict[str, str]]:
+    """Extract all Estado Comercializacao options."""
+    return extract_dropdown_options(
+        page, COMERC_DROPDOWN_SELECTOR, desc="Comercializacao options"
+    )
+
+
+def select_dropdown_option(page: Page, selector: str, value: str) -> None:
+    """Select option on a select dropdown."""
+    page.wait_for_selector(selector, state="attached", timeout=10000)
+    page.select_option(selector, value, timeout=5000)
 
 
 def select_atc_option(page: Page, atc_value: str) -> None:
-    """Select an ATC option using PrimeFaces widget API or standard select.
-
-    Args:
-        page: Playwright Page instance.
-        atc_value: The option value string (e.g., 'REF_CLASS_ATC:A01A').
-
-    """
-    page.wait_for_selector(ATC_DROPDOWN_SELECTOR, state="attached", timeout=10000)
-    try:
-        page.select_option(ATC_DROPDOWN_SELECTOR, atc_value, timeout=5000)
-    except Exception:
-        page.evaluate(
-            f"if (window.PF && PF('widget_mainForm_classif_atc')) {{ "
-            f"  PF('widget_mainForm_classif_atc').selectValue('{atc_value}'); "
-            f"}}"
-        )
+    """Select an ATC option."""
+    select_dropdown_option(page, ATC_DROPDOWN_SELECTOR, atc_value)
 
 
 def download_single_document(
@@ -557,19 +764,7 @@ def download_single_document(
     doc_type: str = "Document",
     timeout_ms: int = 15000,
 ) -> bool:
-    """Download and validate document if not already cached and valid on disk.
-
-    Args:
-        icon_locator: Locator pointing to the download icon element.
-        target_filepath: Destination file path on local disk.
-        page: Playwright Page instance.
-        doc_type: Human-readable document type label for logging.
-        timeout_ms: Download wait timeout in milliseconds.
-
-    Returns:
-        True if download succeeded and passed integrity check, False otherwise.
-
-    """
+    """Download and validate document if not already cached and valid on disk."""
     if os.path.exists(target_filepath) and validate_pdf(target_filepath):
         return True
 
@@ -594,28 +789,14 @@ def download_single_document(
 
 def extract_medicine_row(
     row: Locator,
-    atc: Dict[str, str],
+    atc: Optional[Dict[str, str]],
     page: Page,
     download_dir_rcms: str = DOWNLOAD_DIR_RCMS,
     download_dir_leaflets: str = DOWNLOAD_DIR_LEAFLETS,
     download_dir_mmr: str = DOWNLOAD_DIR_MMR,
     downloaded_files: Optional[Set[str]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Extract full drug metadata, RCM, Patient Leaflet (FI), and MMR documents.
-
-    Args:
-        row: Playwright Locator pointing to the table tr.
-        atc: Dict with 'value' and 'label' of current ATC category.
-        page: Playwright Page instance for downloading.
-        download_dir_rcms: Directory where RCM PDFs are stored.
-        download_dir_leaflets: Directory where Leaflet PDFs are stored.
-        download_dir_mmr: Directory where MMR documents are stored.
-        downloaded_files: In-memory set of downloaded filenames.
-
-    Returns:
-        Dict representing the structured medicine record, or None on error.
-
-    """
+    """Extract full drug metadata, RCM, Patient Leaflet (FI), and MMR documents."""
     if downloaded_files is None:
         downloaded_files = set()
 
@@ -710,7 +891,11 @@ def extract_medicine_row(
             mmr_verified = True
             downloaded_files.add(mmr_filename)
 
-    raw_atc = atc["value"].replace("REF_CLASS_ATC:", "").strip()
+    raw_atc = ""
+    atc_label = ""
+    if atc and atc.get("value"):
+        raw_atc = atc["value"].replace("REF_CLASS_ATC:", "").strip()
+        atc_label = atc.get("label", "")
 
     return {
         "id_key": id_key,
@@ -723,7 +908,7 @@ def extract_medicine_row(
         "commercialization": commercialization,
         "aim_status": aim_status,
         "atc_codes": [raw_atc] if raw_atc else [],
-        "atc_labels": [atc["label"]] if atc.get("label") else [],
+        "atc_labels": [atc_label] if atc_label else [],
         "has_rcm": has_rcm,
         "rcm_filename": rcm_filename,
         "rcm_downloaded": rcm_downloaded,
@@ -739,41 +924,29 @@ def extract_medicine_row(
     }
 
 
-def process_atc_category(
+def process_dimension_category(
     page: Page,
-    atc: Dict[str, str],
+    selector: str,
+    category: Dict[str, str],
     target_url: str,
+    atc_meta: Optional[Dict[str, str]] = None,
     downloaded_files: Optional[Set[str]] = None,
     download_dir_rcms: str = DOWNLOAD_DIR_RCMS,
     download_dir_leaflets: str = DOWNLOAD_DIR_LEAFLETS,
     download_dir_mmr: str = DOWNLOAD_DIR_MMR,
 ) -> List[Dict[str, Any]]:
-    """Execute search for a single ATC category and extract medicines & documents.
-
-    Args:
-        page: Playwright Page instance.
-        atc: Dict containing 'value' and 'label'.
-        target_url: URL to reload in case of failure.
-        downloaded_files: Set of filenames already downloaded.
-        download_dir_rcms: Directory where RCM documents will be saved.
-        download_dir_leaflets: Directory where Leaflet documents will be saved.
-        download_dir_mmr: Directory where MMR documents will be saved.
-
-    Returns:
-        List of extracted medicine record dicts for this category.
-
-    """
+    """Execute search for a single dimension category and extract medicines."""
     if downloaded_files is None:
         downloaded_files = set()
 
-    cat_value = atc["value"]
-    cat_label = atc["label"]
-    logger.info(f"Querying ATC: {cat_label} ({cat_value})")
+    cat_value = category["value"]
+    cat_label = category["label"]
+    logger.info(f"Querying: {cat_label} ({cat_value})")
 
     extracted_records: List[Dict[str, Any]] = []
 
     page.wait_for_selector(SEARCH_BUTTON_SELECTOR, state="visible", timeout=15000)
-    select_atc_option(page, cat_value)
+    select_dropdown_option(page, selector, cat_value)
     page.locator(SEARCH_BUTTON_SELECTOR).click(timeout=10000)
     page.wait_for_selector(RESULTS_TABLE_SELECTOR, state="visible", timeout=15000)
     page.wait_for_timeout(1000)
@@ -785,13 +958,13 @@ def process_atc_category(
     page_num = 1
     while True:
         rows = page.locator(f"{TABLE_BODY_SELECTOR} tr").all()
-        rcm_count_on_page = 0
-        fi_count_on_page = 0
+        rcm_count = 0
+        fi_count = 0
 
         for row in rows:
             record = extract_medicine_row(
                 row=row,
-                atc=atc,
+                atc=atc_meta,
                 page=page,
                 download_dir_rcms=download_dir_rcms,
                 download_dir_leaflets=download_dir_leaflets,
@@ -801,14 +974,13 @@ def process_atc_category(
             if record:
                 extracted_records.append(record)
                 if record.get("rcm_downloaded"):
-                    rcm_count_on_page += 1
+                    rcm_count += 1
                 if record.get("fi_downloaded"):
-                    fi_count_on_page += 1
+                    fi_count += 1
 
         logger.info(
-            f"ATC {cat_value} - Page {page_num}: "
-            f"Extracted {len(rows)} rows, {rcm_count_on_page} RCMs, "
-            f"{fi_count_on_page} Leaflets."
+            f"{cat_value} - Page {page_num}: "
+            f"Extracted {len(rows)} rows, {rcm_count} RCMs, {fi_count} Leaflets."
         )
 
         next_button = page.locator(NEXT_PAGE_SELECTOR).first
@@ -826,6 +998,29 @@ def process_atc_category(
     return extracted_records
 
 
+def process_atc_category(
+    page: Page,
+    atc: Dict[str, str],
+    target_url: str,
+    downloaded_files: Optional[Set[str]] = None,
+    download_dir_rcms: str = DOWNLOAD_DIR_RCMS,
+    download_dir_leaflets: str = DOWNLOAD_DIR_LEAFLETS,
+    download_dir_mmr: str = DOWNLOAD_DIR_MMR,
+) -> List[Dict[str, Any]]:
+    """Execute search for a single ATC category."""
+    return process_dimension_category(
+        page=page,
+        selector=ATC_DROPDOWN_SELECTOR,
+        category=atc,
+        target_url=target_url,
+        atc_meta=atc,
+        downloaded_files=downloaded_files,
+        download_dir_rcms=download_dir_rcms,
+        download_dir_leaflets=download_dir_leaflets,
+        download_dir_mmr=download_dir_mmr,
+    )
+
+
 def retry_missing_documents(
     page: Page,
     target_url: str,
@@ -834,20 +1029,7 @@ def retry_missing_documents(
     download_dir_leaflets: str = DOWNLOAD_DIR_LEAFLETS,
     download_dir_mmr: str = DOWNLOAD_DIR_MMR,
 ) -> Tuple[int, int]:
-    """Execute Stage 2: Target and retry downloading all missing published documents.
-
-    Args:
-        page: Playwright Page instance.
-        target_url: URL of the search page.
-        db_path: Path to SQLite database.
-        download_dir_rcms: RCM directory.
-        download_dir_leaflets: Leaflet directory.
-        download_dir_mmr: MMR directory.
-
-    Returns:
-        Tuple of (recovered_rcms_count, recovered_leaflets_count).
-
-    """
+    """Execute Stage 2: Retry Downloads of Missing Files."""
     logger.info("Starting Stage 2: Retry Downloads of Missing Files...")
     recovered_rcms = 0
     recovered_fis = 0
@@ -894,7 +1076,6 @@ def retry_missing_documents(
                 SEARCH_BUTTON_SELECTOR, state="visible", timeout=15000
             )
 
-            # Fill registration number or drug name input
             reg_input = page.locator(REG_NUMBER_INPUT_SELECTOR)
             name_input = page.locator(DRUG_NAME_INPUT_SELECTOR)
 
@@ -921,7 +1102,6 @@ def retry_missing_documents(
                 if (med_id and row_med_id == med_id) or (
                     drug_name and row_drug_name == drug_name
                 ):
-                    # 1. Retry RCM if needed
                     if item.get("has_rcm") and not item.get("rcm_downloaded"):
                         rcm_icon = row.locator(RCM_ICON_SELECTOR)
                         if rcm_icon.count() > 0:
@@ -944,7 +1124,6 @@ def retry_missing_documents(
                                     )
                                     conn.commit()
 
-                    # 2. Retry Leaflet (FI) if needed
                     if item.get("has_fi") and not item.get("fi_downloaded"):
                         fi_icon = row.locator(FI_ICON_SELECTOR)
                         if fi_icon.count() > 0:
@@ -984,18 +1163,7 @@ def audit_documents_and_integrity(
     download_dir_leaflets: str = DOWNLOAD_DIR_LEAFLETS,
     download_dir_mmr: str = DOWNLOAD_DIR_MMR,
 ) -> Dict[str, Any]:
-    """Audit all scraped medicines, document coverage, and file integrity.
-
-    Args:
-        medicines: Dict mapping medicine ID keys to their records.
-        download_dir_rcms: Path to directory containing RCM PDFs.
-        download_dir_leaflets: Path to directory containing Leaflet PDFs.
-        download_dir_mmr: Path to directory containing MMR PDFs.
-
-    Returns:
-        Dict containing comprehensive audit statistics and verification.
-
-    """
+    """Audit all scraped medicines, document coverage, and file integrity."""
     total_drugs = len(medicines)
     drugs_with_rcm = [m for m in medicines.values() if m.get("has_rcm")]
     drugs_without_rcm = [m for m in medicines.values() if not m.get("has_rcm")]
@@ -1010,10 +1178,38 @@ def audit_documents_and_integrity(
     drugs_with_mmr = [m for m in medicines.values() if m.get("has_mmr")]
     mmrs_downloaded = [m for m in drugs_with_mmr if m.get("mmr_downloaded")]
 
+    # Breakdown by Status
+    auth_count = sum(
+        1 for m in medicines.values() if "Autorizado" in m.get("aim_status", "")
+    )
+    caducado_count = sum(
+        1 for m in medicines.values() if "Caducado" in m.get("aim_status", "")
+    )
+    revogado_count = sum(
+        1 for m in medicines.values() if "Revogado" in m.get("aim_status", "")
+    )
+    comercializado_count = sum(
+        1
+        for m in medicines.values()
+        if m.get("commercialization", "").strip() == "Comercializado"
+    )
+
+    distinct_dcis = len(
+        {
+            m.get("active_substance")
+            for m in medicines.values()
+            if m.get("active_substance")
+        }
+    )
+
     def check_folder(folder_path: str) -> Tuple[int, int, int]:
         if not os.path.exists(folder_path):
             return 0, 0, 0
-        files = [f for f in os.listdir(folder_path) if f.lower().endswith(".pdf")]
+        files = [
+            f
+            for f in os.listdir(folder_path)
+            if f.lower().endswith(".pdf") or f.lower().endswith(".doc")
+        ]
         intact = sum(1 for f in files if validate_pdf(os.path.join(folder_path, f)))
         corrupted = len(files) - intact
         return len(files), intact, corrupted
@@ -1028,6 +1224,11 @@ def audit_documents_and_integrity(
 
     audit_summary = {
         "total_unique_drugs": total_drugs,
+        "distinct_active_substances_dci": distinct_dcis,
+        "drugs_autorizado_status": auth_count,
+        "drugs_caducado_status": caducado_count,
+        "drugs_revogado_status": revogado_count,
+        "drugs_comercializado_status": comercializado_count,
         "drugs_with_rcm_published_on_portal": len(drugs_with_rcm),
         "drugs_without_rcm_published_on_portal": len(drugs_without_rcm),
         "rcm_download_success_count": len(rcms_downloaded),
@@ -1067,18 +1268,31 @@ def audit_documents_and_integrity(
 
 def print_summary_table(
     audit: Dict[str, Any],
-    atcs_processed: int,
-    total_atcs: int = 3193,
+    db_path: str = DB_PATH,
+    benchmark: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Print a clean, formatted executive summary table to stdout.
+    """Print the complete executive audit table with per-sweep document breakdown.
 
     Args:
         audit: Audit summary dictionary from audit_documents_and_integrity.
-        atcs_processed: Count of processed ATC categories.
-        total_atcs: Total expected ATC categories.
+        db_path: Path to SQLite database file.
+        benchmark: Optional benchmark dict from fetch_portal_benchmark_stats.
 
     """
-    atc_pct = (atcs_processed / total_atcs * 100) if total_atcs else 100.0
+    if benchmark is None:
+        benchmark = {
+            "portal_last_updated": "12/08/2026",
+            "official_active_substances_dci": 1692,
+            "official_marketed_medicines": 10426,
+            "official_marketed_presentations": 12645,
+        }
+
+    sweeps = load_all_sweep_metrics(db_path=db_path)
+    total_drugs = audit.get("total_unique_drugs", 0)
+    distinct_dci = audit.get("distinct_active_substances_dci", 0)
+    off_dci = benchmark.get("official_active_substances_dci", 1692)
+    dci_cov = (distinct_dci / off_dci * 100) if off_dci else 0.0
+
     rcm_pub = audit.get("drugs_with_rcm_published_on_portal", 0)
     rcm_dl = audit.get("rcm_download_success_count", 0)
     rcm_pct = (rcm_dl / rcm_pub * 100) if rcm_pub else 100.0
@@ -1093,62 +1307,90 @@ def print_summary_table(
     corrupted = audit.get("total_corrupted_pdfs_all_folders", 0)
     integrity_pct = audit.get("overall_integrity_rate_percent", 100.0)
 
-    total_drugs = audit.get("total_unique_drugs", 0)
+    sep_thick = "=" * 96
+    sep_thin = "-" * 96
 
-    sep_thick = "=" * 88
-    sep_thin = "-" * 88
-    hdr = f"{'Category':<22} {'Metric Name':<28} {'Count / Status':<20} {'Notes'}"
+    off_dcis = benchmark.get("official_active_substances_dci", 1692)
+    off_meds = benchmark.get("official_marketed_medicines", 10426)
+    off_pres = benchmark.get("official_marketed_presentations", 12645)
+    last_upd = benchmark.get("portal_last_updated", "Unknown")
+
+    rcm_disk = audit.get("total_rcm_pdfs_on_disk", 0)
+    fi_disk = audit.get("total_leaflet_pdfs_on_disk", 0)
+    auth_cnt = audit.get("drugs_autorizado_status", 0)
+    caduc_cnt = audit.get("drugs_caducado_status", 0) + audit.get(
+        "drugs_revogado_status", 0
+    )
+    comerc_cnt = audit.get("drugs_comercializado_status", 0)
 
     lines = [
         "",
         sep_thick,
-        f"{'INFOMED SCRAPER AUDIT REPORT':^88}",
+        f"{'INFOMED MASTER AUDIT & COMPARISON REPORT':^96}",
         sep_thick,
-        hdr,
+        "  PORTAL OFFICIAL BENCHMARK (https://extranet.infarmed.pt/INFOMED-fo/index.xhtml)",
+        f"  Portal Last Updated Date : {last_upd}",
+        f"  Active Substances (DCI)  : {off_dcis:,}",
+        f"  Marketed Medicines       : {off_meds:,}",
+        f"  Marketed Presentations   : {off_pres:,}",
         sep_thin,
-        f"{'Catalog Scope':<22} {'ATC Categories Traversed':<28} "
-        f"{f'{atcs_processed:,} / {total_atcs:,} ({atc_pct:.1f}%)':<20} "
-        "All valid categories",
-        f"{'':<22} {'Unique Medicines in DB':<28} "
-        f"{f'{total_drugs:,}':<20} "
-        "Distinct formulations",
-        sep_thin,
-        f"{'SmPC Documents (RCM)':<22} {'Published on Portal':<28} "
-        f"{f'{rcm_pub:,}':<20} Published by INFARMED",
-        f"{'':<22} {'Downloaded & Verified':<28} "
-        f"{f'{rcm_dl:,} ({rcm_pct:.1f}%)':<20} Saved in downloads/rcms",
-        f"{'':<22} {'Missing on Portal':<28} "
-        f"{f'{rcm_miss:,}':<20} Server null/ghost links",
-        sep_thin,
-        f"{'Patient Leaflets (FI)':<22} {'Published on Portal':<28} "
-        f"{f'{fi_pub:,}':<20} Published by INFARMED",
-        f"{'':<22} {'Downloaded & Verified':<28} "
-        f"{f'{fi_dl:,} ({fi_pct:.1f}%)':<20} Saved in downloads/leaflets",
-        f"{'':<22} {'Missing on Portal':<28} "
-        f"{f'{fi_miss:,}':<20} Server null/ghost links",
-        sep_thin,
-        f"{'Files on Disk':<22} {'Total Documents on Disk':<28} "
-        f"{f'{tot_disk:,}':<20} RCMs + Leaflets",
-        f"{'':<22} {'Corrupted Files':<28} {f'{corrupted:,} (0.0%)':<20} 100% intact",
-        f"{'':<22} {'File Integrity Rate':<28} "
-        f"{f'{integrity_pct:.1f}%':<20} Header, trailer & pdfinfo",
-        sep_thick,
-        "",
+        "  PER-SWEEP DOCUMENT HARVESTING BREAKDOWN",
+        f"  {'Sweep Dimension':<24} {'Categories':<14} {'Drugs Found':<14} "
+        f"{'RCMs on Portal / DL':<22} {'Leaflets on Portal / DL'}",
+        "  " + "-" * 92,
     ]
+
+    if sweeps:
+        for sw in sweeps:
+            name = sw["sweep_name"]
+            cats = f"{sw['categories_processed']:,}/{sw['total_categories']:,}"
+            drugs = f"{sw['medicines_encountered']:,}"
+            rcm_str = f"{sw['rcms_available']:,} / {sw['rcms_downloaded']:,}"
+            fi_str = f"{sw['leaflets_available']:,} / {sw['leaflets_downloaded']:,}"
+            lines.append(f"  {name:<24} {cats:<14} {drugs:<14} {rcm_str:<22} {fi_str}")
+    else:
+        atcs_done = len(load_atc_progress_from_db(db_path=db_path))
+        lines.append(
+            f"  {'1. WHO ATC Traversal':<24} {f'{atcs_done:,}/3,193':<14} "
+            f"{f'{total_drugs:,}':<14} "
+            f"{f'{rcm_pub:,} / {rcm_dl:,} ({rcm_pct:.1f}%)':<22} "
+            f"{f'{fi_pub:,} / {fi_dl:,} ({fi_pct:.1f}%)'}"
+        )
+
+    lines.extend(
+        [
+            sep_thin,
+            "  COMBINED DATABASE CATALOG & BENCHMARK COMPARISON",
+            f"  Unique Medicines in DB   : {total_drugs:,} (vs {off_meds:,} official)",
+            f"  Distinct DCIs in DB      : {distinct_dci:,} / {off_dci:,} "
+            f"({dci_cov:.1f}% coverage)",
+            f"  - Autorizado Status      : {auth_cnt:,}",
+            f"  - Caducado / Revogado    : {caduc_cnt:,}",
+            f"  - Comercializado         : {comerc_cnt:,}",
+            sep_thin,
+            "  DOCUMENT HARVESTING & RETRY RESULTS",
+            f"  SmPC Documents (RCM)     : {rcm_dl:,} / {rcm_pub:,} "
+            f"({rcm_pct:.1f}%) downloaded & verified",
+            f"  Patient Leaflets (FI)    : {fi_dl:,} / {fi_pub:,} "
+            f"({fi_pct:.1f}%) downloaded & verified",
+            f"  Missing on Portal        : {rcm_miss:,} RCMs, {fi_miss:,} FIs "
+            "(server null/ghost links)",
+            sep_thin,
+            "  PHYSICAL DISK & BINARY INTEGRITY",
+            f"  Total Documents on Disk  : {tot_disk:,} PDFs "
+            f"({rcm_disk:,} RCMs + {fi_disk:,} Leaflets)",
+            f"  Corrupted Files on Disk  : {corrupted:,} (0.0%)",
+            f"  Overall File Integrity   : {integrity_pct:.1f}% "
+            "(Validated: %PDF-, %%EOF, OLE2, pdfinfo)",
+            sep_thick,
+            "",
+        ]
+    )
     print("\n".join(lines))
 
 
 def create_browser_session(p: Any, headless: bool = True) -> Tuple[Any, Any, Page]:
-    """Launch a low-memory Chromium browser, context, and page.
-
-    Args:
-        p: Playwright instance.
-        headless: Whether to run in headless mode.
-
-    Returns:
-        Tuple of (browser, context, page).
-
-    """
+    """Launch a low-memory Chromium browser, context, and page."""
     browser = p.chromium.launch(
         headless=headless,
         args=CHROMIUM_LOW_MEM_ARGS,
@@ -1160,17 +1402,125 @@ def create_browser_session(p: Any, headless: bool = True) -> Tuple[Any, Any, Pag
     return browser, context, page
 
 
+def run_dimension_sweep(
+    sweep_name: str,
+    selector: str,
+    progress_table: str,
+    page: Page,
+    p: Any,
+    db_path: str = DB_PATH,
+    headless: bool = True,
+    downloaded_files: Optional[Set[str]] = None,
+) -> None:
+    """Execute a generalized sweep across a classification or filter dimension."""
+    if downloaded_files is None:
+        downloaded_files = set()
+
+    processed_codes: Set[str] = load_progress_table(progress_table, db_path=db_path)
+    options = extract_dropdown_options(page, selector, desc=sweep_name)
+    unprocessed = [opt for opt in options if opt["value"] not in processed_codes]
+
+    logger.info(
+        f"Starting {sweep_name}: {len(unprocessed)} / {len(options)} "
+        "categories remaining."
+    )
+
+    count_in_session = 0
+    total_encountered = 0
+    rcms_avail_sweep = 0
+    rcms_dl_sweep = 0
+    fis_avail_sweep = 0
+    fis_dl_sweep = 0
+
+    for opt in unprocessed:
+        code_val = opt["value"]
+
+        # Context / Browser recycling
+        if count_in_session > 0 and count_in_session % BROWSER_RECYCLE_INTERVAL == 0:
+            try:
+                page.close()
+            except Exception:
+                pass
+            gc.collect()
+            export_db_to_datasets(db_path=db_path)
+
+        try:
+            records = process_dimension_category(
+                page=page,
+                selector=selector,
+                category=opt,
+                target_url=TARGET_URL,
+                atc_meta=(opt if selector == ATC_DROPDOWN_SELECTOR else None),
+                downloaded_files=downloaded_files,
+                download_dir_rcms=DOWNLOAD_DIR_RCMS,
+                download_dir_leaflets=DOWNLOAD_DIR_LEAFLETS,
+                download_dir_mmr=DOWNLOAD_DIR_MMR,
+            )
+
+            if records:
+                upsert_medicamentos_batch(records, db_path=db_path)
+                total_encountered += len(records)
+                for r in records:
+                    if r.get("has_rcm"):
+                        rcms_avail_sweep += 1
+                    if r.get("rcm_downloaded"):
+                        rcms_dl_sweep += 1
+                    if r.get("has_fi"):
+                        fis_avail_sweep += 1
+                    if r.get("fi_downloaded"):
+                        fis_dl_sweep += 1
+
+            processed_codes.add(code_val)
+            mark_progress_item(
+                progress_table, code_val, opt.get("label", ""), db_path=db_path
+            )
+            count_in_session += 1
+
+        except Exception as err:
+            logger.error(f"Error processing {sweep_name} '{code_val}': {err}")
+            try:
+                page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=20000)
+                page.wait_for_selector(
+                    SEARCH_BUTTON_SELECTOR, state="visible", timeout=15000
+                )
+            except Exception as reload_err:
+                logger.error(f"Failed to reload page: {reload_err}")
+
+    # Record sweep metrics
+    save_sweep_metrics(
+        sweep_name=sweep_name,
+        total_categories=len(options),
+        categories_processed=len(processed_codes),
+        medicines_encountered=total_encountered,
+        rcms_available=rcms_avail_sweep,
+        rcms_downloaded=rcms_dl_sweep,
+        leaflets_available=fis_avail_sweep,
+        leaflets_downloaded=fis_dl_sweep,
+        db_path=db_path,
+    )
+
+
 def retrieve_infomed_rcms(
     headless: bool = True,
     db_path: str = DB_PATH,
     stage_2_only: bool = False,
+    sweep_all: bool = False,
+    sweep_dispensa: bool = False,
+    sweep_cft: bool = False,
+    sweep_aim: bool = False,
+    sweep_comerc: bool = False,
 ) -> Dict[str, Any]:
-    """Retrieve all RCMs, Leaflets, and metadata with automatic Stage 2 execution.
+    """Retrieve all RCMs, Leaflets, and metadata with multi-sweep support.
 
     Args:
         headless: Whether to run Playwright in headless mode.
         db_path: Path to SQLite database file.
-        stage_2_only: Whether to skip Stage 1 and run only Stage 2 targeted retry.
+        stage_2_only: Whether to skip sweeps and run only Stage 2 targeted retry.
+        sweep_all: Run full sweep across all 5 classification dimensions.
+        sweep_dispensa: Sweep Dispensa classifications.
+        sweep_cft: Sweep Farmacoterapeutica classifications.
+        sweep_aim: Sweep Estado da AIM filters.
+        sweep_comerc: Sweep Estado de Comercializacao filters.
 
     Returns:
         Audit report dict summarizing scraped data and file integrity.
@@ -1178,148 +1528,90 @@ def retrieve_infomed_rcms(
     """
     init_db(db_path=db_path)
 
-    processed_atcs: Set[str] = load_atc_progress_from_db(db_path=db_path)
     downloaded_files: Set[str] = set()
-
     for d in (DOWNLOAD_DIR_RCMS, DOWNLOAD_DIR_LEAFLETS, DOWNLOAD_DIR_MMR):
         if os.path.exists(d):
             for fname in os.listdir(d):
-                if fname.lower().endswith(".pdf"):
+                if fname.lower().endswith(".pdf") or fname.lower().endswith(".doc"):
                     downloaded_files.add(fname)
 
     existing_db_meds = load_all_medicamentos_from_db(db_path=db_path)
     logger.info(
-        f"Starting pipeline with unified SQLite: {len(processed_atcs)} "
-        f"ATCs completed, {len(existing_db_meds)} drugs in DB, "
-        f"{len(downloaded_files)} PDFs saved."
+        f"Starting pipeline with unified SQLite: {len(existing_db_meds)} "
+        f"drugs in DB, {len(downloaded_files)} PDFs saved."
     )
 
     with sync_playwright() as p:
         browser, context, page = create_browser_session(p, headless=headless)
 
+        # 1. Fetch live portal homepage benchmark totals
+        benchmark = fetch_portal_benchmark_stats(page)
+        page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=20000)
+
         if not stage_2_only:
-            atc_categories = extract_atc_categories(page)
-            unprocessed_atcs = [
-                atc for atc in atc_categories if atc["value"] not in processed_atcs
-            ]
+            # Dimension 1: WHO ATC Traversal (Default)
+            run_dimension_sweep(
+                sweep_name="1. WHO ATC Traversal",
+                selector=ATC_DROPDOWN_SELECTOR,
+                progress_table="atc_progress",
+                page=page,
+                p=p,
+                db_path=db_path,
+                headless=headless,
+                downloaded_files=downloaded_files,
+            )
 
-            if not unprocessed_atcs:
-                logger.info(
-                    f"All {len(atc_categories)} ATC categories have already been "
-                    "processed in Stage 1. Transitioning directly to Stage 2: "
-                    "Retry Downloads of Missing Files..."
+            # Dimension 2: Classificação Quanto à Dispensa
+            if sweep_all or sweep_dispensa:
+                run_dimension_sweep(
+                    sweep_name="2. Dispensa Classes",
+                    selector=DISPENSA_DROPDOWN_SELECTOR,
+                    progress_table="dispensa_progress",
+                    page=page,
+                    p=p,
+                    db_path=db_path,
+                    headless=headless,
+                    downloaded_files=downloaded_files,
                 )
-            else:
-                logger.info(
-                    f"Stage 1: {len(unprocessed_atcs)} / {len(atc_categories)} "
-                    "ATC categories remaining to process."
+
+            # Dimension 3: Classificação Farmacoterapêutica (CFT)
+            if sweep_all or sweep_cft:
+                run_dimension_sweep(
+                    sweep_name="3. Farmacoterapêutica",
+                    selector=CFT_DROPDOWN_SELECTOR,
+                    progress_table="cft_progress",
+                    page=page,
+                    p=p,
+                    db_path=db_path,
+                    headless=headless,
+                    downloaded_files=downloaded_files,
                 )
 
-                atc_count_in_session = 0
+            # Dimension 4: Estado da AIM
+            if sweep_all or sweep_aim:
+                run_dimension_sweep(
+                    sweep_name="4. Estado da AIM",
+                    selector=AIM_DROPDOWN_SELECTOR,
+                    progress_table="aim_progress",
+                    page=page,
+                    p=p,
+                    db_path=db_path,
+                    headless=headless,
+                    downloaded_files=downloaded_files,
+                )
 
-                # Stage 1: Traverse remaining ATC categories
-                for atc in unprocessed_atcs:
-                    atc_val = atc["value"]
-
-                    # Periodic Browser Recycling & Checkpoint (every 100 ATCs)
-                    should_recycle_browser = (
-                        atc_count_in_session > 0
-                        and atc_count_in_session % BROWSER_RECYCLE_INTERVAL == 0
-                    )
-                    should_recycle_context = (
-                        atc_count_in_session > 0
-                        and atc_count_in_session % CONTEXT_RECYCLE_INTERVAL == 0
-                    )
-
-                    if should_recycle_browser:
-                        logger.info(
-                            f"Recycling full browser process after "
-                            f"{atc_count_in_session} ATCs and exporting checkpoint..."
-                        )
-                        try:
-                            page.close()
-                            context.close()
-                            browser.close()
-                        except Exception:
-                            pass
-                        gc.collect()
-                        export_db_to_datasets(db_path=db_path)
-                        browser, context, page = create_browser_session(
-                            p, headless=headless
-                        )
-
-                    # Periodic Context Recycling (every 25 ATCs)
-                    elif should_recycle_context:
-                        logger.info(
-                            f"Recycling browser context after "
-                            f"{atc_count_in_session} ATCs to flush download buffers..."
-                        )
-                        try:
-                            page.close()
-                            context.close()
-                        except Exception:
-                            pass
-                        gc.collect()
-                        context = browser.new_context(accept_downloads=True)
-                        page = context.new_page()
-                        page.set_default_timeout(15000)
-                        page.goto(
-                            TARGET_URL, wait_until="domcontentloaded", timeout=30000
-                        )
-
-                    try:
-                        records = process_atc_category(
-                            page,
-                            atc,
-                            TARGET_URL,
-                            downloaded_files=downloaded_files,
-                            download_dir_rcms=DOWNLOAD_DIR_RCMS,
-                            download_dir_leaflets=DOWNLOAD_DIR_LEAFLETS,
-                            download_dir_mmr=DOWNLOAD_DIR_MMR,
-                        )
-
-                        if records:
-                            upsert_medicamentos_batch(records, db_path=db_path)
-
-                        processed_atcs.add(atc_val)
-                        mark_atc_processed_in_db(
-                            atc_val, atc.get("label", ""), db_path=db_path
-                        )
-                        atc_count_in_session += 1
-
-                    except Exception as err:
-                        logger.error(f"Error processing ATC '{atc_val}': {err}")
-                        try:
-                            page.goto(
-                                TARGET_URL, wait_until="domcontentloaded", timeout=20000
-                            )
-                            page.wait_for_selector(
-                                SEARCH_BUTTON_SELECTOR, state="visible", timeout=15000
-                            )
-                        except Exception as reload_err:
-                            logger.error(
-                                f"Failed to reload page: {reload_err}. "
-                                "Reopening page..."
-                            )
-                            try:
-                                page.close()
-                                context.close()
-                                gc.collect()
-                                context = browser.new_context(accept_downloads=True)
-                                page = context.new_page()
-                                page.set_default_timeout(15000)
-                                page.goto(
-                                    TARGET_URL,
-                                    wait_until="domcontentloaded",
-                                    timeout=20000,
-                                )
-                                page.wait_for_selector(
-                                    SEARCH_BUTTON_SELECTOR,
-                                    state="visible",
-                                    timeout=15000,
-                                )
-                            except Exception as page_err:
-                                logger.error(f"Failed to re-init page: {page_err}")
+            # Dimension 5: Estado de Comercialização
+            if sweep_all or sweep_comerc:
+                run_dimension_sweep(
+                    sweep_name="5. Comercialização",
+                    selector=COMERC_DROPDOWN_SELECTOR,
+                    progress_table="comerc_progress",
+                    page=page,
+                    p=p,
+                    db_path=db_path,
+                    headless=headless,
+                    downloaded_files=downloaded_files,
+                )
 
         # Stage 2: Retry Downloads of Missing Files
         retry_missing_documents(
@@ -1338,7 +1630,7 @@ def retrieve_infomed_rcms(
         except Exception:
             pass
 
-    # Final export of SQLite to JSON and CSV
+    # Final export and reporting
     export_db_to_datasets(db_path=db_path)
     all_final_meds = load_all_medicamentos_from_db(db_path=db_path)
     audit = audit_documents_and_integrity(
@@ -1347,18 +1639,12 @@ def retrieve_infomed_rcms(
         download_dir_leaflets=DOWNLOAD_DIR_LEAFLETS,
         download_dir_mmr=DOWNLOAD_DIR_MMR,
     )
-    atcs_done = len(load_atc_progress_from_db(db_path=db_path))
-    print_summary_table(audit, atcs_processed=atcs_done)
+    print_summary_table(audit, db_path=db_path, benchmark=benchmark)
     return audit
 
 
 def parse_cli_args() -> argparse.Namespace:
-    """Parse command-line arguments for the scraper.
-
-    Returns:
-        Parsed arguments namespace.
-
-    """
+    """Parse command-line arguments for the scraper."""
     parser = argparse.ArgumentParser(
         description="INFOMED Scraper: Download RCMs, Leaflets, and drug metadata."
     )
@@ -1367,7 +1653,37 @@ def parse_cli_args() -> argparse.Namespace:
         "--retry-only",
         action="store_true",
         dest="stage_2_only",
-        help="Skip Stage 1 (ATC traversal) and run only Stage 2 targeted retry.",
+        help="Skip category sweeps and run only Stage 2 (Retry Missing Files).",
+    )
+    parser.add_argument(
+        "--sweep-all",
+        action="store_true",
+        dest="sweep_all",
+        help="Execute sweeps across all dimensions (ATC, Dispensa, CFT, AIM, Comerc).",
+    )
+    parser.add_argument(
+        "--dispensa",
+        action="store_true",
+        dest="sweep_dispensa",
+        help="Execute sweep across Classificação Quanto à Dispensa (8 categories).",
+    )
+    parser.add_argument(
+        "--cft",
+        action="store_true",
+        dest="sweep_cft",
+        help="Execute sweep across Classificação Farmacoterapêutica (380 categories).",
+    )
+    parser.add_argument(
+        "--aim",
+        action="store_true",
+        dest="sweep_aim",
+        help="Execute sweep across Estado da AIM filters (Autorizado, Caducado, etc.).",
+    )
+    parser.add_argument(
+        "--comerc",
+        action="store_true",
+        dest="sweep_comerc",
+        help="Execute sweep across Estado de Comercialização filters.",
     )
     parser.add_argument(
         "--no-headless",
@@ -1390,4 +1706,9 @@ if __name__ == "__main__":
         headless=args.headless,
         db_path=args.db,
         stage_2_only=args.stage_2_only,
+        sweep_all=args.sweep_all,
+        sweep_dispensa=args.sweep_dispensa,
+        sweep_cft=args.sweep_cft,
+        sweep_aim=args.sweep_aim,
+        sweep_comerc=args.sweep_comerc,
     )

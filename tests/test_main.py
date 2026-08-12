@@ -7,9 +7,13 @@ from infomed.main import (
     export_db_to_datasets,
     init_db,
     load_all_medicamentos_from_db,
+    load_all_sweep_metrics,
     load_atc_progress_from_db,
     mark_atc_processed_in_db,
+    parse_cli_args,
+    print_summary_table,
     sanitize_filename,
+    save_sweep_metrics,
     upsert_medicamentos_batch,
     validate_pdf,
 )
@@ -77,6 +81,30 @@ def test_atc_progress_in_sqlite(tmp_path):
 
     loaded = load_atc_progress_from_db(db_path=db_path)
     assert loaded == {"REF_ATC_1", "REF_ATC_2"}
+
+
+def test_sweep_metrics_storage(tmp_path):
+    """Test saving and loading per-sweep document statistics."""
+    db_path = str(tmp_path / "test_sweeps.db")
+    init_db(db_path=db_path, auto_migrate=False)
+
+    save_sweep_metrics(
+        sweep_name="1. WHO ATC Traversal",
+        total_categories=3193,
+        categories_processed=3167,
+        medicines_encountered=8900,
+        rcms_available=7265,
+        rcms_downloaded=7202,
+        leaflets_available=7268,
+        leaflets_downloaded=7151,
+        db_path=db_path,
+    )
+
+    sweeps = load_all_sweep_metrics(db_path=db_path)
+    assert len(sweeps) == 1
+    assert sweeps[0]["sweep_name"] == "1. WHO ATC Traversal"
+    assert sweeps[0]["rcms_downloaded"] == 7202
+    assert sweeps[0]["leaflets_downloaded"] == 7151
 
 
 def test_sqlite_db_upsert_and_export(tmp_path):
@@ -181,6 +209,9 @@ def test_audit_documents_and_integrity(tmp_path, monkeypatch):
             "id_key": "med_1",
             "med_id": "1",
             "drug_name": "Drug 1",
+            "active_substance": "Substance A",
+            "aim_status": "Autorizado",
+            "commercialization": "Comercializado",
             "has_rcm": True,
             "rcm_filename": "valid_rcm.pdf",
             "rcm_downloaded": True,
@@ -195,6 +226,9 @@ def test_audit_documents_and_integrity(tmp_path, monkeypatch):
             "id_key": "med_2",
             "med_id": "2",
             "drug_name": "Drug 2",
+            "active_substance": "Substance B",
+            "aim_status": "Caducado",
+            "commercialization": "Não Comercializado",
             "has_rcm": False,
             "has_fi": False,
             "has_mmr": False,
@@ -209,6 +243,10 @@ def test_audit_documents_and_integrity(tmp_path, monkeypatch):
     )
 
     assert audit["total_unique_drugs"] == 2
+    assert audit["distinct_active_substances_dci"] == 2
+    assert audit["drugs_autorizado_status"] == 1
+    assert audit["drugs_caducado_status"] == 1
+    assert audit["drugs_comercializado_status"] == 1
     assert audit["drugs_with_rcm_published_on_portal"] == 1
     assert audit["drugs_with_fi_published_on_portal"] == 1
     assert audit["total_rcm_pdfs_on_disk"] == 1
@@ -221,33 +259,70 @@ def test_audit_documents_and_integrity(tmp_path, monkeypatch):
 
 
 def test_parse_cli_args(monkeypatch):
-    """Test CLI argument parsing for stage2 flag."""
-    from infomed.main import parse_cli_args
-
-    monkeypatch.setattr("sys.argv", ["main.py", "--stage2", "--no-headless"])
+    """Test CLI argument parsing for multi-sweep flags."""
+    monkeypatch.setattr(
+        "sys.argv",
+        ["main.py", "--sweep-all", "--dispensa", "--cft", "--no-headless"],
+    )
     args = parse_cli_args()
-    assert args.stage_2_only is True
+    assert args.sweep_all is True
+    assert args.sweep_dispensa is True
+    assert args.sweep_cft is True
     assert args.headless is False
 
 
-def test_print_summary_table(capsys):
-    """Test printing the executive summary table."""
-    from infomed.main import print_summary_table
+def test_print_summary_table(tmp_path, capsys):
+    """Test printing the executive master summary table with per-sweep breakdown."""
+    db_path = str(tmp_path / "summary_test.db")
+    init_db(db_path=db_path, auto_migrate=False)
+
+    save_sweep_metrics(
+        sweep_name="1. WHO ATC Traversal",
+        total_categories=3193,
+        categories_processed=3167,
+        medicines_encountered=8900,
+        rcms_available=7265,
+        rcms_downloaded=7202,
+        leaflets_available=7268,
+        leaflets_downloaded=7151,
+        db_path=db_path,
+    )
 
     audit = {
-        "total_unique_drugs": 100,
-        "drugs_with_rcm_published_on_portal": 80,
-        "rcm_download_success_count": 80,
-        "rcm_missing_download_count": 0,
-        "drugs_with_fi_published_on_portal": 80,
-        "fi_download_success_count": 80,
-        "fi_missing_download_count": 0,
-        "total_pdfs_on_disk_all_folders": 160,
+        "total_unique_drugs": 8900,
+        "distinct_active_substances_dci": 1565,
+        "drugs_autorizado_status": 8200,
+        "drugs_caducado_status": 400,
+        "drugs_revogado_status": 300,
+        "drugs_comercializado_status": 7500,
+        "drugs_with_rcm_published_on_portal": 7265,
+        "rcm_download_success_count": 7202,
+        "rcm_missing_download_count": 63,
+        "drugs_with_fi_published_on_portal": 7268,
+        "fi_download_success_count": 7151,
+        "fi_missing_download_count": 117,
+        "total_rcm_pdfs_on_disk": 7531,
+        "total_leaflet_pdfs_on_disk": 7224,
+        "total_pdfs_on_disk_all_folders": 14755,
         "total_corrupted_pdfs_all_folders": 0,
         "overall_integrity_rate_percent": 100.0,
     }
-    print_summary_table(audit, atcs_processed=3193, total_atcs=3193)
+
+    benchmark = {
+        "portal_last_updated": "12/08/2026",
+        "official_active_substances_dci": 1692,
+        "official_marketed_medicines": 10426,
+        "official_marketed_presentations": 12645,
+    }
+
+    print_summary_table(audit, db_path=db_path, benchmark=benchmark)
     captured = capsys.readouterr()
-    assert "INFOMED SCRAPER AUDIT REPORT" in captured.out
-    assert "3,193 / 3,193 (100.0%)" in captured.out
-    assert "100" in captured.out
+
+    assert "INFOMED MASTER AUDIT & COMPARISON REPORT" in captured.out
+    assert "1,692" in captured.out
+    assert "10,426" in captured.out
+    assert "12/08/2026" in captured.out
+    assert "1. WHO ATC Traversal" in captured.out
+    assert "7,202" in captured.out
+    assert "7,151" in captured.out
+    assert "100.0%" in captured.out
