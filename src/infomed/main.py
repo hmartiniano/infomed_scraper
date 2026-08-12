@@ -848,7 +848,7 @@ def retry_missing_documents(
         Tuple of (recovered_rcms_count, recovered_leaflets_count).
 
     """
-    logger.info("Starting Stage 2: Targeted Document Reconciliation Pass...")
+    logger.info("Starting Stage 2: Retry Downloads of Missing Files...")
     recovered_rcms = 0
     recovered_fis = 0
 
@@ -1207,7 +1207,7 @@ def retrieve_infomed_rcms(
                 logger.info(
                     f"All {len(atc_categories)} ATC categories have already been "
                     "processed in Stage 1. Transitioning directly to Stage 2: "
-                    "Targeted Document Reconciliation..."
+                    "Retry Downloads of Missing Files..."
                 )
             else:
                 logger.info(
@@ -1321,7 +1321,7 @@ def retrieve_infomed_rcms(
                             except Exception as page_err:
                                 logger.error(f"Failed to re-init page: {page_err}")
 
-        # Stage 2: Targeted Document Reconciliation Pass
+        # Stage 2: Retry Downloads of Missing Files
         retry_missing_documents(
             page,
             TARGET_URL,
