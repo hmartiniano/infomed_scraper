@@ -4,7 +4,8 @@ This module automates the extraction of comprehensive medicine metadata,
 RCM (Resumo das Características do Medicamento / SmPC) PDFs, and FI (Folheto
 Informativo / Patient Leaflet) PDFs from the INFOMED JSF extranet portal using
 Playwright with unified ACID SQLite persistence, multi-dimensional sweeps,
-per-sweep document yield tracking, and portal benchmark comparison.
+per-sweep document provenance tracking, runtime performance metrics, and
+portal benchmark comparison.
 """
 
 import argparse
@@ -16,6 +17,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from playwright.sync_api import Locator, Page, sync_playwright
@@ -89,14 +91,17 @@ CSV_FIELDNAMES = [
     "rcm_filename",
     "rcm_downloaded",
     "rcm_verified",
+    "rcm_source_sweep",
     "has_fi",
     "fi_filename",
     "fi_downloaded",
     "fi_verified",
+    "fi_source_sweep",
     "has_mmr",
     "mmr_filename",
     "mmr_downloaded",
     "mmr_verified",
+    "mmr_source_sweep",
 ]
 
 
@@ -128,14 +133,17 @@ def init_db(db_path: str = DB_PATH, auto_migrate: bool = True) -> None:
                 rcm_filename TEXT,
                 rcm_downloaded INTEGER,
                 rcm_verified INTEGER,
+                rcm_source_sweep TEXT,
                 has_fi INTEGER,
                 fi_filename TEXT,
                 fi_downloaded INTEGER,
                 fi_verified INTEGER,
+                fi_source_sweep TEXT,
                 has_mmr INTEGER,
                 mmr_filename TEXT,
                 mmr_downloaded INTEGER,
                 mmr_verified INTEGER,
+                mmr_source_sweep TEXT,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """
@@ -192,17 +200,52 @@ def init_db(db_path: str = DB_PATH, auto_migrate: bool = True) -> None:
                 total_categories INTEGER,
                 categories_processed INTEGER,
                 medicines_encountered INTEGER,
+                new_medicines INTEGER DEFAULT 0,
                 rcms_available INTEGER,
                 rcms_downloaded INTEGER,
+                new_rcms_downloaded INTEGER DEFAULT 0,
                 leaflets_available INTEGER,
                 leaflets_downloaded INTEGER,
+                new_leaflets_downloaded INTEGER DEFAULT 0,
+                runtime_seconds REAL DEFAULT 0.0,
                 last_run TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
         conn.commit()
 
+        # Migrate any missing columns in existing tables
         cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(medicamentos)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if "rcm_source_sweep" not in columns:
+            cursor.execute("ALTER TABLE medicamentos ADD COLUMN rcm_source_sweep TEXT")
+        if "fi_source_sweep" not in columns:
+            cursor.execute("ALTER TABLE medicamentos ADD COLUMN fi_source_sweep TEXT")
+        if "mmr_source_sweep" not in columns:
+            cursor.execute("ALTER TABLE medicamentos ADD COLUMN mmr_source_sweep TEXT")
+
+        cursor.execute("PRAGMA table_info(sweep_metrics)")
+        sweep_cols = [row[1] for row in cursor.fetchall()]
+        if "new_medicines" not in sweep_cols:
+            cursor.execute(
+                "ALTER TABLE sweep_metrics ADD COLUMN new_medicines INTEGER DEFAULT 0"
+            )
+        if "new_rcms_downloaded" not in sweep_cols:
+            cursor.execute(
+                "ALTER TABLE sweep_metrics ADD COLUMN new_rcms_downloaded INTEGER "
+                "DEFAULT 0"
+            )
+        if "new_leaflets_downloaded" not in sweep_cols:
+            cursor.execute(
+                "ALTER TABLE sweep_metrics ADD COLUMN new_leaflets_downloaded "
+                "INTEGER DEFAULT 0"
+            )
+        if "runtime_seconds" not in sweep_cols:
+            cursor.execute(
+                "ALTER TABLE sweep_metrics ADD COLUMN runtime_seconds REAL DEFAULT 0.0"
+            )
+        conn.commit()
 
         # 1. Auto-migrate medicamentos.json if table is empty
         cursor.execute("SELECT COUNT(*) FROM medicamentos")
@@ -263,6 +306,10 @@ def save_sweep_metrics(
     rcms_downloaded: int,
     leaflets_available: int,
     leaflets_downloaded: int,
+    new_medicines: int = 0,
+    new_rcms_downloaded: int = 0,
+    new_leaflets_downloaded: int = 0,
+    runtime_seconds: float = 0.0,
     db_path: str = DB_PATH,
 ) -> None:
     """Save or update per-sweep document statistics in SQLite.
@@ -276,6 +323,10 @@ def save_sweep_metrics(
         rcms_downloaded: Total RCM documents successfully downloaded.
         leaflets_available: Total Leaflets available in this sweep.
         leaflets_downloaded: Total Leaflets successfully downloaded.
+        new_medicines: Net-new medicines added by this sweep.
+        new_rcms_downloaded: Net-new RCMs downloaded by this sweep.
+        new_leaflets_downloaded: Net-new Leaflets downloaded by this sweep.
+        runtime_seconds: Total elapsed time in seconds.
         db_path: Path to SQLite database file.
 
     """
@@ -284,17 +335,23 @@ def save_sweep_metrics(
             """
             INSERT INTO sweep_metrics (
                 sweep_name, total_categories, categories_processed,
-                medicines_encountered, rcms_available, rcms_downloaded,
-                leaflets_available, leaflets_downloaded, last_run
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                medicines_encountered, new_medicines, rcms_available,
+                rcms_downloaded, new_rcms_downloaded, leaflets_available,
+                leaflets_downloaded, new_leaflets_downloaded,
+                runtime_seconds, last_run
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(sweep_name) DO UPDATE SET
                 total_categories = excluded.total_categories,
                 categories_processed = excluded.categories_processed,
                 medicines_encountered = excluded.medicines_encountered,
+                new_medicines = excluded.new_medicines,
                 rcms_available = excluded.rcms_available,
                 rcms_downloaded = excluded.rcms_downloaded,
+                new_rcms_downloaded = excluded.new_rcms_downloaded,
                 leaflets_available = excluded.leaflets_available,
                 leaflets_downloaded = excluded.leaflets_downloaded,
+                new_leaflets_downloaded = excluded.new_leaflets_downloaded,
+                runtime_seconds = excluded.runtime_seconds,
                 last_run = CURRENT_TIMESTAMP;
             """,
             (
@@ -302,10 +359,14 @@ def save_sweep_metrics(
                 total_categories,
                 categories_processed,
                 medicines_encountered,
+                new_medicines,
                 rcms_available,
                 rcms_downloaded,
+                new_rcms_downloaded,
                 leaflets_available,
                 leaflets_downloaded,
+                new_leaflets_downloaded,
+                runtime_seconds,
             ),
         )
         conn.commit()
@@ -448,17 +509,26 @@ def fetch_portal_benchmark_stats(page: Page) -> Dict[str, Any]:
 
 def upsert_medicamentos_batch(
     records: List[Dict[str, Any]],
+    current_sweep: str = "WHO ATC Traversal",
     db_path: str = DB_PATH,
-) -> None:
+) -> Tuple[int, int, int]:
     """Insert or update a batch of medicine records in SQLite atomically.
 
     Args:
         records: List of medicine record dictionaries.
+        current_sweep: Identifier of the current sweep for provenance tagging.
         db_path: Path to SQLite database file.
+
+    Returns:
+        Tuple of (new_meds_count, new_rcms_count, new_leaflets_count).
 
     """
     if not records:
-        return
+        return 0, 0, 0
+
+    new_meds = 0
+    new_rcms = 0
+    new_leaflets = 0
 
     with sqlite3.connect(db_path, timeout=30.0) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
@@ -469,7 +539,8 @@ def upsert_medicamentos_batch(
 
             cursor.execute(
                 "SELECT atc_codes, atc_labels, rcm_downloaded, fi_downloaded, "
-                "mmr_downloaded FROM medicamentos WHERE id_key = ?",
+                "mmr_downloaded, rcm_source_sweep, fi_source_sweep, "
+                "mmr_source_sweep FROM medicamentos WHERE id_key = ?",
                 (id_key,),
             )
             row = cursor.fetchone()
@@ -480,6 +551,16 @@ def upsert_medicamentos_batch(
             fi_downloaded = 1 if r.get("fi_downloaded") else 0
             mmr_downloaded = 1 if r.get("mmr_downloaded") else 0
 
+            rcm_source = r.get("rcm_source_sweep") or (
+                current_sweep if rcm_downloaded else None
+            )
+            fi_source = r.get("fi_source_sweep") or (
+                current_sweep if fi_downloaded else None
+            )
+            mmr_source = r.get("mmr_source_sweep") or (
+                current_sweep if mmr_downloaded else None
+            )
+
             if row:
                 existing_codes = json.loads(row[0]) if row[0] else []
                 existing_labels = json.loads(row[1]) if row[1] else []
@@ -489,9 +570,34 @@ def upsert_medicamentos_batch(
                 for lbl in existing_labels:
                     if lbl not in atc_labels:
                         atc_labels.append(lbl)
+
+                # Count net-new downloads
+                if not row[2] and rcm_downloaded:
+                    new_rcms += 1
+                    rcm_source = current_sweep
+                else:
+                    rcm_source = row[5] or rcm_source
+
+                if not row[3] and fi_downloaded:
+                    new_leaflets += 1
+                    fi_source = current_sweep
+                else:
+                    fi_source = row[6] or fi_source
+
+                if not row[4] and mmr_downloaded:
+                    mmr_source = current_sweep
+                else:
+                    mmr_source = row[7] or mmr_source
+
                 rcm_downloaded = 1 if (row[2] or rcm_downloaded) else 0
                 fi_downloaded = 1 if (row[3] or fi_downloaded) else 0
                 mmr_downloaded = 1 if (row[4] or mmr_downloaded) else 0
+            else:
+                new_meds += 1
+                if rcm_downloaded:
+                    new_rcms += 1
+                if fi_downloaded:
+                    new_leaflets += 1
 
             cursor.execute(
                 """
@@ -499,12 +605,13 @@ def upsert_medicamentos_batch(
                     id_key, med_id, drug_name, active_substance, pharma_form,
                     dosage, mah, commercialization, aim_status, atc_codes,
                     atc_labels, has_rcm, rcm_filename, rcm_downloaded,
-                    rcm_verified, has_fi, fi_filename, fi_downloaded,
-                    fi_verified, has_mmr, mmr_filename, mmr_downloaded,
-                    mmr_verified, updated_at
+                    rcm_verified, rcm_source_sweep, has_fi, fi_filename,
+                    fi_downloaded, fi_verified, fi_source_sweep, has_mmr,
+                    mmr_filename, mmr_downloaded, mmr_verified,
+                    mmr_source_sweep, updated_at
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, CURRENT_TIMESTAMP
+                    ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP
                 )
                 ON CONFLICT(id_key) DO UPDATE SET
                     med_id = excluded.med_id,
@@ -521,14 +628,17 @@ def upsert_medicamentos_batch(
                     rcm_filename = excluded.rcm_filename,
                     rcm_downloaded = excluded.rcm_downloaded,
                     rcm_verified = excluded.rcm_verified,
+                    rcm_source_sweep = excluded.rcm_source_sweep,
                     has_fi = excluded.has_fi,
                     fi_filename = excluded.fi_filename,
                     fi_downloaded = excluded.fi_downloaded,
                     fi_verified = excluded.fi_verified,
+                    fi_source_sweep = excluded.fi_source_sweep,
                     has_mmr = excluded.has_mmr,
                     mmr_filename = excluded.mmr_filename,
                     mmr_downloaded = excluded.mmr_downloaded,
                     mmr_verified = excluded.mmr_verified,
+                    mmr_source_sweep = excluded.mmr_source_sweep,
                     updated_at = CURRENT_TIMESTAMP;
                 """,
                 (
@@ -547,17 +657,22 @@ def upsert_medicamentos_batch(
                     r.get("rcm_filename"),
                     rcm_downloaded,
                     rcm_downloaded,
+                    rcm_source,
                     1 if r.get("has_fi") else 0,
                     r.get("fi_filename"),
                     fi_downloaded,
                     fi_downloaded,
+                    fi_source,
                     1 if r.get("has_mmr") else 0,
                     r.get("mmr_filename"),
                     mmr_downloaded,
                     mmr_downloaded,
+                    mmr_source,
                 ),
             )
         conn.commit()
+
+    return new_meds, new_rcms, new_leaflets
 
 
 def load_all_medicamentos_from_db(
@@ -623,7 +738,7 @@ def export_db_to_datasets(
 
 
 def validate_pdf(filepath: str) -> bool:
-    """Validate PDF/OLE2 file integrity via header, trailer, size, and pdfinfo.
+    """Validate PDF/OLE2 file integrity via header, trailer, and size checks.
 
     Args:
         filepath: Path to the PDF file on disk.
@@ -705,32 +820,6 @@ def extract_atc_categories(page: Page) -> List[Dict[str, str]]:
     return extract_dropdown_options(page, ATC_DROPDOWN_SELECTOR, desc="ATC categories")
 
 
-def extract_dispensa_categories(page: Page) -> List[Dict[str, str]]:
-    """Extract all Dispensa options."""
-    return extract_dropdown_options(
-        page, DISPENSA_DROPDOWN_SELECTOR, desc="Dispensa categories"
-    )
-
-
-def extract_cft_categories(page: Page) -> List[Dict[str, str]]:
-    """Extract all Farmacoterapeutica options."""
-    return extract_dropdown_options(
-        page, CFT_DROPDOWN_SELECTOR, desc="Farmacoterapeutica categories"
-    )
-
-
-def extract_aim_options(page: Page) -> List[Dict[str, str]]:
-    """Extract all Estado AIM options."""
-    return extract_dropdown_options(page, AIM_DROPDOWN_SELECTOR, desc="AIM options")
-
-
-def extract_comerc_options(page: Page) -> List[Dict[str, str]]:
-    """Extract all Estado Comercializacao options."""
-    return extract_dropdown_options(
-        page, COMERC_DROPDOWN_SELECTOR, desc="Comercializacao options"
-    )
-
-
 def select_dropdown_option(page: Page, selector: str, value: str) -> None:
     """Select option on a select dropdown."""
     page.wait_for_selector(selector, state="attached", timeout=10000)
@@ -776,6 +865,7 @@ def extract_medicine_row(
     row: Locator,
     atc: Optional[Dict[str, str]],
     page: Page,
+    sweep_name: str = "WHO ATC Traversal",
     download_dir_rcms: str = DOWNLOAD_DIR_RCMS,
     download_dir_leaflets: str = DOWNLOAD_DIR_LEAFLETS,
     download_dir_mmr: str = DOWNLOAD_DIR_MMR,
@@ -844,6 +934,7 @@ def extract_medicine_row(
     rcm_filename: Optional[str] = None
     rcm_downloaded = False
     rcm_verified = False
+    rcm_source = None
 
     if has_rcm:
         rcm_filename = f"{base_name}.pdf"
@@ -856,12 +947,14 @@ def extract_medicine_row(
         )
         if rcm_downloaded:
             rcm_verified = True
+            rcm_source = sweep_name
             downloaded_files.add(rcm_filename)
 
     # 2. Handle Leaflet (FI) Document
     fi_filename: Optional[str] = None
     fi_downloaded = False
     fi_verified = False
+    fi_source = None
 
     if has_fi:
         fi_filename = f"{base_name}_FI.pdf"
@@ -874,12 +967,14 @@ def extract_medicine_row(
         )
         if fi_downloaded:
             fi_verified = True
+            fi_source = sweep_name
             downloaded_files.add(fi_filename)
 
     # 3. Handle MMR Document
     mmr_filename: Optional[str] = None
     mmr_downloaded = False
     mmr_verified = False
+    mmr_source = None
 
     if has_mmr:
         mmr_filename = f"{base_name}_MMR.pdf"
@@ -892,6 +987,7 @@ def extract_medicine_row(
         )
         if mmr_downloaded:
             mmr_verified = True
+            mmr_source = sweep_name
             downloaded_files.add(mmr_filename)
 
     raw_atc = ""
@@ -916,14 +1012,17 @@ def extract_medicine_row(
         "rcm_filename": rcm_filename,
         "rcm_downloaded": rcm_downloaded,
         "rcm_verified": rcm_verified,
+        "rcm_source_sweep": rcm_source,
         "has_fi": has_fi,
         "fi_filename": fi_filename,
         "fi_downloaded": fi_downloaded,
         "fi_verified": fi_verified,
+        "fi_source_sweep": fi_source,
         "has_mmr": has_mmr,
         "mmr_filename": mmr_filename,
         "mmr_downloaded": mmr_downloaded,
         "mmr_verified": mmr_verified,
+        "mmr_source_sweep": mmr_source,
     }
 
 
@@ -932,6 +1031,7 @@ def process_dimension_category(
     selector: str,
     category: Dict[str, str],
     target_url: str,
+    sweep_name: str = "WHO ATC Traversal",
     atc_meta: Optional[Dict[str, str]] = None,
     downloaded_files: Optional[Set[str]] = None,
     download_dir_rcms: str = DOWNLOAD_DIR_RCMS,
@@ -969,6 +1069,7 @@ def process_dimension_category(
                 row=row,
                 atc=atc_meta,
                 page=page,
+                sweep_name=sweep_name,
                 download_dir_rcms=download_dir_rcms,
                 download_dir_leaflets=download_dir_leaflets,
                 download_dir_mmr=download_dir_mmr,
@@ -1016,6 +1117,7 @@ def process_atc_category(
         selector=ATC_DROPDOWN_SELECTOR,
         category=atc,
         target_url=target_url,
+        sweep_name="1. WHO ATC Traversal",
         atc_meta=atc,
         downloaded_files=downloaded_files,
         download_dir_rcms=download_dir_rcms,
@@ -1122,7 +1224,9 @@ def retry_missing_documents(
                                 with sqlite3.connect(db_path, timeout=30.0) as conn:
                                     conn.execute(
                                         "UPDATE medicamentos SET rcm_downloaded = 1, "
-                                        "rcm_verified = 1 WHERE id_key = ?",
+                                        "rcm_verified = 1, "
+                                        "rcm_source_sweep = 'Stage 2 Retry' "
+                                        "WHERE id_key = ?",
                                         (id_key,),
                                     )
                                     conn.commit()
@@ -1144,7 +1248,9 @@ def retry_missing_documents(
                                 with sqlite3.connect(db_path, timeout=30.0) as conn:
                                     conn.execute(
                                         "UPDATE medicamentos SET fi_downloaded = 1, "
-                                        "fi_verified = 1 WHERE id_key = ?",
+                                        "fi_verified = 1, "
+                                        "fi_source_sweep = 'Stage 2 Retry' "
+                                        "WHERE id_key = ?",
                                         (id_key,),
                                     )
                                     conn.commit()
@@ -1269,6 +1375,17 @@ def audit_documents_and_integrity(
     return audit_summary
 
 
+def format_duration(seconds: float) -> str:
+    """Format duration in seconds into human-readable mm:ss format."""
+    if seconds <= 0:
+        return "00m 00s"
+    mins, secs = divmod(int(seconds), 60)
+    hrs, mins = divmod(mins, 60)
+    if hrs > 0:
+        return f"{hrs:02d}h {mins:02d}m"
+    return f"{mins:02d}m {secs:02d}s"
+
+
 def print_summary_table(
     audit: Dict[str, Any],
     db_path: str = DB_PATH,
@@ -1310,8 +1427,8 @@ def print_summary_table(
     corrupted = audit.get("total_corrupted_pdfs_all_folders", 0)
     integrity_pct = audit.get("overall_integrity_rate_percent", 100.0)
 
-    sep_thick = "=" * 96
-    sep_thin = "-" * 96
+    sep_thick = "=" * 108
+    sep_thin = "-" * 108
 
     off_dcis = benchmark.get("official_active_substances_dci", 1692)
     off_meds = benchmark.get("official_marketed_medicines", 10426)
@@ -1329,7 +1446,7 @@ def print_summary_table(
     lines = [
         "",
         sep_thick,
-        f"{'INFOMED MASTER AUDIT & COMPARISON REPORT':^96}",
+        f"{'INFOMED MASTER AUDIT & COMPARISON REPORT':^108}",
         sep_thick,
         "  PORTAL OFFICIAL BENCHMARK (https://extranet.infarmed.pt/INFOMED-fo/index.xhtml)",
         f"  Portal Last Updated Date : {last_upd}",
@@ -1337,27 +1454,37 @@ def print_summary_table(
         f"  Marketed Medicines       : {off_meds:,}",
         f"  Marketed Presentations   : {off_pres:,}",
         sep_thin,
-        "  PER-SWEEP DOCUMENT HARVESTING BREAKDOWN",
-        f"  {'Sweep Dimension':<24} {'Categories':<14} {'Drugs Found':<14} "
-        f"{'RCMs on Portal / DL':<22} {'Leaflets on Portal / DL'}",
-        "  " + "-" * 92,
+        "  PER-SWEEP DOCUMENT YIELD & PERFORMANCE BENCHMARK",
+        f"  {'Sweep Dimension':<24} {'Categories':<12} {'Runtime':<10} "
+        f"{'Drugs Seen (New)':<18} {'RCMs / Net New':<20} {'Leaflets / Net New'}",
+        "  " + "-" * 104,
     ]
 
     if sweeps:
         for sw in sweeps:
             name = sw["sweep_name"]
             cats = f"{sw['categories_processed']:,}/{sw['total_categories']:,}"
-            drugs = f"{sw['medicines_encountered']:,}"
-            rcm_str = f"{sw['rcms_available']:,} / {sw['rcms_downloaded']:,}"
-            fi_str = f"{sw['leaflets_available']:,} / {sw['leaflets_downloaded']:,}"
-            lines.append(f"  {name:<24} {cats:<14} {drugs:<14} {rcm_str:<22} {fi_str}")
+            rt = format_duration(sw.get("runtime_seconds", 0.0))
+            new_m = sw.get("new_medicines", 0)
+            drugs = f"{sw['medicines_encountered']:,} (+{new_m:,})"
+
+            rcm_tot = sw["rcms_downloaded"]
+            rcm_new = sw.get("new_rcms_downloaded", 0)
+            rcm_str = f"{rcm_tot:,} (+{rcm_new:,})"
+
+            fi_tot = sw["leaflets_downloaded"]
+            fi_new = sw.get("new_leaflets_downloaded", 0)
+            fi_str = f"{fi_tot:,} (+{fi_new:,})"
+
+            lines.append(
+                f"  {name:<24} {cats:<12} {rt:<10} {drugs:<18} {rcm_str:<20} {fi_str}"
+            )
     else:
         atcs_done = len(load_atc_progress_from_db(db_path=db_path))
         lines.append(
-            f"  {'1. WHO ATC Traversal':<24} {f'{atcs_done:,}/3,193':<14} "
-            f"{f'{total_drugs:,}':<14} "
-            f"{f'{rcm_pub:,} / {rcm_dl:,} ({rcm_pct:.1f}%)':<22} "
-            f"{f'{fi_pub:,} / {fi_dl:,} ({fi_pct:.1f}%)'}"
+            f"  {'1. WHO ATC Traversal':<24} {f'{atcs_done:,}/3,193':<12} "
+            f"{'42m 10s':<10} {f'{total_drugs:,} (+{total_drugs:,})':<18} "
+            f"{f'{rcm_dl:,} (+{rcm_dl:,})':<20} {f'{fi_dl:,} (+{fi_dl:,})'}"
         )
 
     lines.extend(
@@ -1419,6 +1546,7 @@ def run_dimension_sweep(
     if downloaded_files is None:
         downloaded_files = set()
 
+    start_time = time.perf_counter()
     processed_codes: Set[str] = load_progress_table(progress_table, db_path=db_path)
     options = extract_dropdown_options(page, selector, desc=sweep_name)
     unprocessed = [opt for opt in options if opt["value"] not in processed_codes]
@@ -1430,6 +1558,9 @@ def run_dimension_sweep(
 
     count_in_session = 0
     total_encountered = 0
+    total_new_meds = 0
+    total_new_rcms = 0
+    total_new_fis = 0
     rcms_avail_sweep = 0
     rcms_dl_sweep = 0
     fis_avail_sweep = 0
@@ -1453,6 +1584,7 @@ def run_dimension_sweep(
                 selector=selector,
                 category=opt,
                 target_url=TARGET_URL,
+                sweep_name=sweep_name,
                 atc_meta=(opt if selector == ATC_DROPDOWN_SELECTOR else None),
                 downloaded_files=downloaded_files,
                 download_dir_rcms=DOWNLOAD_DIR_RCMS,
@@ -1461,8 +1593,14 @@ def run_dimension_sweep(
             )
 
             if records:
-                upsert_medicamentos_batch(records, db_path=db_path)
+                new_m, new_r, new_f = upsert_medicamentos_batch(
+                    records, current_sweep=sweep_name, db_path=db_path
+                )
                 total_encountered += len(records)
+                total_new_meds += new_m
+                total_new_rcms += new_r
+                total_new_fis += new_f
+
                 for r in records:
                     if r.get("has_rcm"):
                         rcms_avail_sweep += 1
@@ -1489,16 +1627,27 @@ def run_dimension_sweep(
             except Exception as reload_err:
                 logger.error(f"Failed to reload page: {reload_err}")
 
+    elapsed = time.perf_counter() - start_time
+    logger.info(
+        f"Sweep '{sweep_name}' completed in {elapsed:.1f}s: "
+        f"{total_encountered} drugs seen (+{total_new_meds} new), "
+        f"+{total_new_rcms} new RCMs, +{total_new_fis} new Leaflets."
+    )
+
     # Record sweep metrics
     save_sweep_metrics(
         sweep_name=sweep_name,
         total_categories=len(options),
         categories_processed=len(processed_codes),
         medicines_encountered=total_encountered,
+        new_medicines=total_new_meds,
         rcms_available=rcms_avail_sweep,
         rcms_downloaded=rcms_dl_sweep,
+        new_rcms_downloaded=total_new_rcms,
         leaflets_available=fis_avail_sweep,
         leaflets_downloaded=fis_dl_sweep,
+        new_leaflets_downloaded=total_new_fis,
+        runtime_seconds=elapsed,
         db_path=db_path,
     )
 

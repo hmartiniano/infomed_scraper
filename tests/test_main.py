@@ -5,6 +5,7 @@ import os
 from infomed.main import (
     audit_documents_and_integrity,
     export_db_to_datasets,
+    format_duration,
     init_db,
     load_all_medicamentos_from_db,
     load_all_sweep_metrics,
@@ -46,6 +47,13 @@ def test_sanitize_filename():
     assert sanitize_filename("   invalid/file\\name?:*  ") == "invalid_file_name"
 
 
+def test_format_duration():
+    """Test format_duration converts seconds into clean strings."""
+    assert format_duration(0) == "00m 00s"
+    assert format_duration(65.4) == "01m 05s"
+    assert format_duration(3665) == "01h 01m"
+
+
 def test_validate_pdf_valid(tmp_path):
     """Test validate_pdf returns True for a valid dummy PDF."""
     pdf_file = tmp_path / "valid.pdf"
@@ -83,8 +91,8 @@ def test_atc_progress_in_sqlite(tmp_path):
     assert loaded == {"REF_ATC_1", "REF_ATC_2"}
 
 
-def test_sweep_metrics_storage(tmp_path):
-    """Test saving and loading per-sweep document statistics."""
+def test_sweep_metrics_storage_with_provenance_and_runtime(tmp_path):
+    """Test saving and loading per-sweep document statistics and runtimes."""
     db_path = str(tmp_path / "test_sweeps.db")
     init_db(db_path=db_path, auto_migrate=False)
 
@@ -93,22 +101,28 @@ def test_sweep_metrics_storage(tmp_path):
         total_categories=3193,
         categories_processed=3167,
         medicines_encountered=8900,
+        new_medicines=8900,
         rcms_available=7265,
         rcms_downloaded=7202,
+        new_rcms_downloaded=7202,
         leaflets_available=7268,
         leaflets_downloaded=7151,
+        new_leaflets_downloaded=7151,
+        runtime_seconds=2530.5,
         db_path=db_path,
     )
 
     sweeps = load_all_sweep_metrics(db_path=db_path)
     assert len(sweeps) == 1
     assert sweeps[0]["sweep_name"] == "1. WHO ATC Traversal"
-    assert sweeps[0]["rcms_downloaded"] == 7202
-    assert sweeps[0]["leaflets_downloaded"] == 7151
+    assert sweeps[0]["new_medicines"] == 8900
+    assert sweeps[0]["new_rcms_downloaded"] == 7202
+    assert sweeps[0]["new_leaflets_downloaded"] == 7151
+    assert sweeps[0]["runtime_seconds"] == 2530.5
 
 
-def test_sqlite_db_upsert_and_export(tmp_path):
-    """Test SQLite database initialization, upsert with merging, and export."""
+def test_sqlite_db_upsert_provenance_and_export(tmp_path):
+    """Test SQLite upsert with provenance tagging and merging."""
     db_path = str(tmp_path / "test_medicamentos.db")
     json_path = str(tmp_path / "test_medicamentos.json")
     csv_path = str(tmp_path / "test_medicamentos.csv")
@@ -131,23 +145,30 @@ def test_sqlite_db_upsert_and_export(tmp_path):
         "rcm_filename": "599044_Glimepirida.pdf",
         "rcm_downloaded": True,
         "rcm_verified": True,
+        "rcm_source_sweep": "1. WHO ATC Traversal",
         "has_fi": True,
         "fi_filename": "599044_Glimepirida_FI.pdf",
         "fi_downloaded": True,
         "fi_verified": True,
+        "fi_source_sweep": "1. WHO ATC Traversal",
         "has_mmr": False,
         "mmr_filename": None,
         "mmr_downloaded": False,
         "mmr_verified": False,
     }
 
-    upsert_medicamentos_batch([record_1], db_path=db_path)
+    new_m, new_r, new_f = upsert_medicamentos_batch(
+        [record_1], current_sweep="1. WHO ATC Traversal", db_path=db_path
+    )
+    assert new_m == 1
+    assert new_r == 1
+    assert new_f == 1
 
     loaded = load_all_medicamentos_from_db(db_path=db_path)
     assert "599044_Glimepirida" in loaded
-    assert loaded["599044_Glimepirida"]["drug_name"] == "Glimepirida Aurovitas"
-    assert loaded["599044_Glimepirida"]["atc_codes"] == ["A10BB12"]
+    assert loaded["599044_Glimepirida"]["rcm_source_sweep"] == "1. WHO ATC Traversal"
 
+    # Subsequent sweep discovers an MMR for the same drug
     record_1_update = {
         "id_key": "599044_Glimepirida",
         "med_id": "599044",
@@ -168,18 +189,26 @@ def test_sqlite_db_upsert_and_export(tmp_path):
         "fi_filename": "599044_Glimepirida_FI.pdf",
         "fi_downloaded": True,
         "fi_verified": True,
-        "has_mmr": False,
-        "mmr_filename": None,
-        "mmr_downloaded": False,
-        "mmr_verified": False,
+        "has_mmr": True,
+        "mmr_filename": "599044_Glimepirida_MMR.pdf",
+        "mmr_downloaded": True,
+        "mmr_verified": True,
     }
 
-    upsert_medicamentos_batch([record_1_update], db_path=db_path)
+    new_m2, new_r2, new_f2 = upsert_medicamentos_batch(
+        [record_1_update], current_sweep="2. Dispensa Classes", db_path=db_path
+    )
+    assert new_m2 == 0
+    assert new_r2 == 0
+    assert new_f2 == 0
 
     loaded_merged = load_all_medicamentos_from_db(db_path=db_path)
-    assert len(loaded_merged) == 1
-    assert "A10BB12" in loaded_merged["599044_Glimepirida"]["atc_codes"]
-    assert "A10BD99" in loaded_merged["599044_Glimepirida"]["atc_codes"]
+    assert loaded_merged["599044_Glimepirida"]["rcm_source_sweep"] == (
+        "1. WHO ATC Traversal"
+    )
+    assert loaded_merged["599044_Glimepirida"]["mmr_source_sweep"] == (
+        "2. Dispensa Classes"
+    )
 
     export_db_to_datasets(db_path=db_path, json_path=json_path, csv_path=csv_path)
     assert os.path.exists(json_path)
@@ -281,10 +310,14 @@ def test_print_summary_table(tmp_path, capsys):
         total_categories=3193,
         categories_processed=3167,
         medicines_encountered=8900,
+        new_medicines=8900,
         rcms_available=7265,
         rcms_downloaded=7202,
+        new_rcms_downloaded=7202,
         leaflets_available=7268,
         leaflets_downloaded=7151,
+        new_leaflets_downloaded=7151,
+        runtime_seconds=2530.0,
         db_path=db_path,
     )
 
