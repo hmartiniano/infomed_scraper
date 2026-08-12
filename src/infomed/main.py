@@ -1545,17 +1545,19 @@ def run_dimension_sweep(
     sweep_name: str,
     selector: str,
     progress_table: str,
+    browser: Any,
+    context: Any,
     page: Page,
     p: Any,
     db_path: str = DB_PATH,
     headless: bool = True,
     downloaded_files: Optional[Set[str]] = None,
-) -> None:
+) -> Tuple[Any, Any, Page]:
     """Execute a generalized sweep across a classification or filter dimension."""
     if downloaded_files is None:
         downloaded_files = set()
 
-    start_time = time.perf_counter()
+    start_time = time.time()
     processed_codes: Set[str] = load_progress_table(progress_table, db_path=db_path)
     options = extract_dropdown_options(page, selector, desc=sweep_name)
     unprocessed = [opt for opt in options if opt["value"] not in processed_codes]
@@ -1578,14 +1580,17 @@ def run_dimension_sweep(
     for opt in unprocessed:
         code_val = opt["value"]
 
-        # Context / Browser recycling
+        # Context / Browser recycling every 100 categories
         if count_in_session > 0 and count_in_session % BROWSER_RECYCLE_INTERVAL == 0:
             try:
                 page.close()
+                context.close()
+                browser.close()
             except Exception:
                 pass
             gc.collect()
             export_db_to_datasets(db_path=db_path)
+            browser, context, page = create_browser_session(p, headless=headless)
 
         try:
             records = process_dimension_category(
@@ -1629,14 +1634,26 @@ def run_dimension_sweep(
         except Exception as err:
             logger.error(f"Error processing {sweep_name} '{code_val}': {err}")
             try:
-                page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=20000)
-                page.wait_for_selector(
-                    SEARCH_BUTTON_SELECTOR, state="visible", timeout=15000
-                )
+                if page.is_closed():
+                    browser, context, page = create_browser_session(
+                        p, headless=headless
+                    )
+                else:
+                    page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=20000)
+                    page.wait_for_selector(
+                        SEARCH_BUTTON_SELECTOR, state="visible", timeout=15000
+                    )
             except Exception as reload_err:
-                logger.error(f"Failed to reload page: {reload_err}")
+                logger.error(f"Failed to reload page, recreating session: {reload_err}")
+                try:
+                    page.close()
+                    context.close()
+                    browser.close()
+                except Exception:
+                    pass
+                browser, context, page = create_browser_session(p, headless=headless)
 
-    elapsed = time.perf_counter() - start_time
+    elapsed = time.time() - start_time
     logger.info(
         f"Sweep '{sweep_name}' completed in {elapsed:.1f}s: "
         f"{total_encountered} drugs seen (+{total_new_meds} new), "
@@ -1659,6 +1676,7 @@ def run_dimension_sweep(
         runtime_seconds=elapsed,
         db_path=db_path,
     )
+    return browser, context, page
 
 
 def retrieve_infomed_rcms(
@@ -1712,10 +1730,12 @@ def retrieve_infomed_rcms(
 
         if not stage_2_only:
             # Dimension 1: WHO ATC Traversal (Default)
-            run_dimension_sweep(
+            browser, context, page = run_dimension_sweep(
                 sweep_name="1. WHO ATC Traversal",
                 selector=ATC_DROPDOWN_SELECTOR,
                 progress_table="atc_progress",
+                browser=browser,
+                context=context,
                 page=page,
                 p=p,
                 db_path=db_path,
@@ -1725,10 +1745,12 @@ def retrieve_infomed_rcms(
 
             # Dimension 2: Classificação Quanto à Dispensa
             if sweep_all or sweep_dispensa:
-                run_dimension_sweep(
+                browser, context, page = run_dimension_sweep(
                     sweep_name="2. Dispensa Classes",
                     selector=DISPENSA_DROPDOWN_SELECTOR,
                     progress_table="dispensa_progress",
+                    browser=browser,
+                    context=context,
                     page=page,
                     p=p,
                     db_path=db_path,
@@ -1738,10 +1760,12 @@ def retrieve_infomed_rcms(
 
             # Dimension 3: Classificação Farmacoterapêutica (CFT)
             if sweep_all or sweep_cft:
-                run_dimension_sweep(
+                browser, context, page = run_dimension_sweep(
                     sweep_name="3. Farmacoterapêutica",
                     selector=CFT_DROPDOWN_SELECTOR,
                     progress_table="cft_progress",
+                    browser=browser,
+                    context=context,
                     page=page,
                     p=p,
                     db_path=db_path,
@@ -1751,10 +1775,12 @@ def retrieve_infomed_rcms(
 
             # Dimension 4: Estado da AIM
             if sweep_all or sweep_aim:
-                run_dimension_sweep(
+                browser, context, page = run_dimension_sweep(
                     sweep_name="4. Estado da AIM",
                     selector=AIM_DROPDOWN_SELECTOR,
                     progress_table="aim_progress",
+                    browser=browser,
+                    context=context,
                     page=page,
                     p=p,
                     db_path=db_path,
@@ -1764,10 +1790,12 @@ def retrieve_infomed_rcms(
 
             # Dimension 5: Estado de Comercialização
             if sweep_all or sweep_comerc:
-                run_dimension_sweep(
+                browser, context, page = run_dimension_sweep(
                     sweep_name="5. Comercialização",
                     selector=COMERC_DROPDOWN_SELECTOR,
                     progress_table="comerc_progress",
+                    browser=browser,
+                    context=context,
                     page=page,
                     p=p,
                     db_path=db_path,
@@ -1776,6 +1804,9 @@ def retrieve_infomed_rcms(
                 )
 
         # Stage 2: Retry Downloads of Missing Files
+        if page.is_closed():
+            browser, context, page = create_browser_session(p, headless=headless)
+
         retry_missing_documents(
             page,
             TARGET_URL,
