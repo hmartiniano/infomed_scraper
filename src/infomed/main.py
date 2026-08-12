@@ -15,7 +15,6 @@ import logging
 import os
 import re
 import sqlite3
-import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -659,26 +658,12 @@ def validate_pdf(filepath: str) -> bool:
                 if b"%%EOF" not in trailer:
                     logger.warning(f"PDF file '{filepath}' is missing '%%EOF' trailer.")
                     return False
+                return True
             elif is_doc:
                 return True
     except Exception as err:
         logger.warning(f"Failed to read PDF file '{filepath}': {err}")
         return False
-
-    try:
-        res = subprocess.run(
-            ["pdfinfo", filepath],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-        )
-        if res.returncode != 0:
-            logger.warning(f"pdfinfo failed for '{filepath}' (code {res.returncode}).")
-            return False
-    except FileNotFoundError:
-        pass
-    except Exception:
-        pass
 
     return True
 
@@ -810,8 +795,26 @@ def extract_medicine_row(
     pharma_form = cells[3] if len(cells) > 3 else ""
     dosage = cells[4] if len(cells) > 4 else ""
     mah = cells[5] if len(cells) > 5 else ""
-    commercialization = cells[6] if len(cells) > 6 else ""
-    aim_status = cells[7] if len(cells) > 7 else ""
+    raw_com = cells[6] if len(cells) > 6 else ""
+    raw_aim = cells[7] if len(cells) > 7 else ""
+
+    # Parse commercialization: truck icon or text
+    has_truck = row.locator("em.fa-truck, label[id*='blueTruck']").count() > 0
+    if has_truck or "Comercializado" in raw_com:
+        commercialization = "Comercializado"
+    elif raw_com.strip():
+        commercialization = raw_com.strip()
+    else:
+        commercialization = "Não Comercializado"
+
+    # Map numeric AIM status sort code to descriptive label
+    aim_status_map = {
+        "1": "Autorizado",
+        "2": "Suspenso",
+        "3": "Caducado",
+        "4": "Revogado",
+    }
+    aim_status = aim_status_map.get(raw_aim.strip(), raw_aim.strip() or "Autorizado")
 
     clean_drug = sanitize_filename(drug_name)
     clean_dosage = sanitize_filename(dosage)
