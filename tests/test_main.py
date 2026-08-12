@@ -167,6 +167,7 @@ def test_sqlite_db_upsert_provenance_and_export(tmp_path):
     loaded = load_all_medicamentos_from_db(db_path=db_path)
     assert "599044_Glimepirida" in loaded
     assert loaded["599044_Glimepirida"]["rcm_source_sweep"] == "1. WHO ATC Traversal"
+    assert loaded["599044_Glimepirida"]["first_seen_sweep"] == "1. WHO ATC Traversal"
 
     # Subsequent sweep discovers an MMR for the same drug
     record_1_update = {
@@ -203,6 +204,9 @@ def test_sqlite_db_upsert_provenance_and_export(tmp_path):
     assert new_f2 == 0
 
     loaded_merged = load_all_medicamentos_from_db(db_path=db_path)
+    assert loaded_merged["599044_Glimepirida"]["first_seen_sweep"] == (
+        "1. WHO ATC Traversal"
+    )
     assert loaded_merged["599044_Glimepirida"]["rcm_source_sweep"] == (
         "1. WHO ATC Traversal"
     )

@@ -93,6 +93,7 @@ CSV_FIELDNAMES = [
     "aim_status",
     "atc_codes",
     "atc_labels",
+    "first_seen_sweep",
     "has_rcm",
     "rcm_filename",
     "rcm_downloaded",
@@ -135,6 +136,7 @@ def init_db(db_path: str = DB_PATH, auto_migrate: bool = True) -> None:
                 aim_status TEXT,
                 atc_codes TEXT,
                 atc_labels TEXT,
+                first_seen_sweep TEXT,
                 has_rcm INTEGER,
                 rcm_filename TEXT,
                 rcm_downloaded INTEGER,
@@ -205,6 +207,8 @@ def init_db(db_path: str = DB_PATH, auto_migrate: bool = True) -> None:
         cursor = conn.cursor()
         cursor.execute("PRAGMA table_info(medicamentos)")
         columns = [row[1] for row in cursor.fetchall()]
+        if "first_seen_sweep" not in columns:
+            cursor.execute("ALTER TABLE medicamentos ADD COLUMN first_seen_sweep TEXT")
         if "rcm_source_sweep" not in columns:
             cursor.execute("ALTER TABLE medicamentos ADD COLUMN rcm_source_sweep TEXT")
         if "fi_source_sweep" not in columns:
@@ -532,7 +536,7 @@ def upsert_medicamentos_batch(
             cursor.execute(
                 "SELECT atc_codes, atc_labels, rcm_downloaded, fi_downloaded, "
                 "mmr_downloaded, rcm_source_sweep, fi_source_sweep, "
-                "mmr_source_sweep FROM medicamentos WHERE id_key = ?",
+                "mmr_source_sweep, first_seen_sweep FROM medicamentos WHERE id_key = ?",
                 (id_key,),
             )
             row = cursor.fetchone()
@@ -554,6 +558,7 @@ def upsert_medicamentos_batch(
             )
 
             if row:
+                first_seen = row[8] or current_sweep
                 existing_codes = json.loads(row[0]) if row[0] else []
                 existing_labels = json.loads(row[1]) if row[1] else []
                 for c in existing_codes:
@@ -585,6 +590,7 @@ def upsert_medicamentos_batch(
                 fi_downloaded = 1 if (row[3] or fi_downloaded) else 0
                 mmr_downloaded = 1 if (row[4] or mmr_downloaded) else 0
             else:
+                first_seen = current_sweep
                 new_meds += 1
                 if rcm_downloaded:
                     new_rcms += 1
@@ -596,14 +602,14 @@ def upsert_medicamentos_batch(
                 INSERT INTO medicamentos (
                     id_key, med_id, drug_name, active_substance, pharma_form,
                     dosage, mah, commercialization, aim_status, atc_codes,
-                    atc_labels, has_rcm, rcm_filename, rcm_downloaded,
-                    rcm_verified, rcm_source_sweep, has_fi, fi_filename,
-                    fi_downloaded, fi_verified, fi_source_sweep, has_mmr,
-                    mmr_filename, mmr_downloaded, mmr_verified,
+                    atc_labels, first_seen_sweep, has_rcm, rcm_filename,
+                    rcm_downloaded, rcm_verified, rcm_source_sweep, has_fi,
+                    fi_filename, fi_downloaded, fi_verified, fi_source_sweep,
+                    has_mmr, mmr_filename, mmr_downloaded, mmr_verified,
                     mmr_source_sweep, updated_at
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP
                 )
                 ON CONFLICT(id_key) DO UPDATE SET
                     med_id = excluded.med_id,
@@ -616,6 +622,9 @@ def upsert_medicamentos_batch(
                     aim_status = excluded.aim_status,
                     atc_codes = excluded.atc_codes,
                     atc_labels = excluded.atc_labels,
+                    first_seen_sweep = COALESCE(
+                        medicamentos.first_seen_sweep, excluded.first_seen_sweep
+                    ),
                     has_rcm = excluded.has_rcm,
                     rcm_filename = excluded.rcm_filename,
                     rcm_downloaded = excluded.rcm_downloaded,
@@ -645,6 +654,7 @@ def upsert_medicamentos_batch(
                     r.get("aim_status", ""),
                     json.dumps(atc_codes, ensure_ascii=False),
                     json.dumps(atc_labels, ensure_ascii=False),
+                    first_seen,
                     1 if r.get("has_rcm") else 0,
                     r.get("rcm_filename"),
                     rcm_downloaded,
@@ -1536,7 +1546,21 @@ def create_browser_session(p: Any, headless: bool = True) -> Tuple[Any, Any, Pag
     context = browser.new_context(accept_downloads=True)
     page = context.new_page()
     page.set_default_timeout(15000)
-    page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
+
+    for attempt in range(3):
+        try:
+            page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_selector(
+                SEARCH_BUTTON_SELECTOR, state="attached", timeout=15000
+            )
+            break
+        except Exception as e:
+            if attempt == 2:
+                logger.error(f"Failed to load {TARGET_URL} after 3 attempts: {e}")
+                raise e
+            logger.warning(f"Initial page navigation retry {attempt + 1}/3: {e}")
+            time.sleep(2.0)
+
     return browser, context, page
 
 
