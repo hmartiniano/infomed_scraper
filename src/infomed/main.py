@@ -796,7 +796,14 @@ def extract_dropdown_options(
         List of dicts with 'value' and 'label'.
 
     """
-    page.wait_for_selector(selector, state="attached", timeout=15000)
+    try:
+        if "pesquisa-avancada.xhtml" not in page.url:
+            page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=25000)
+        page.wait_for_selector(selector, state="attached", timeout=15000)
+    except Exception:
+        page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=25000)
+        page.wait_for_selector(selector, state="attached", timeout=20000)
+
     eval_js = (
         "options => options.map(opt => "
         "({value: opt.value, label: opt.innerText.trim()}))"
