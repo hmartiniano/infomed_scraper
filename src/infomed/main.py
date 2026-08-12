@@ -312,25 +312,30 @@ def save_sweep_metrics(
     runtime_seconds: float = 0.0,
     db_path: str = DB_PATH,
 ) -> None:
-    """Save or update per-sweep document statistics in SQLite.
-
-    Args:
-        sweep_name: Dimension identifier (e.g. 'WHO ATC Traversal').
-        total_categories: Total categories available in this dimension.
-        categories_processed: Number of categories processed.
-        medicines_encountered: Total medicines found during this sweep.
-        rcms_available: Total RCM documents available in this sweep.
-        rcms_downloaded: Total RCM documents successfully downloaded.
-        leaflets_available: Total Leaflets available in this sweep.
-        leaflets_downloaded: Total Leaflets successfully downloaded.
-        new_medicines: Net-new medicines added by this sweep.
-        new_rcms_downloaded: Net-new RCMs downloaded by this sweep.
-        new_leaflets_downloaded: Net-new Leaflets downloaded by this sweep.
-        runtime_seconds: Total elapsed time in seconds.
-        db_path: Path to SQLite database file.
-
-    """
+    """Save or update per-sweep document statistics in SQLite."""
     with sqlite3.connect(db_path, timeout=30.0) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT medicines_encountered, new_medicines, rcms_available, "
+            "rcms_downloaded, new_rcms_downloaded, leaflets_available, "
+            "leaflets_downloaded, new_leaflets_downloaded, runtime_seconds "
+            "FROM sweep_metrics WHERE sweep_name = ?",
+            (sweep_name,),
+        )
+        existing = cursor.fetchone()
+
+        if existing and medicines_encountered == 0 and existing[0] > 0:
+            # Preserve existing non-zero historical data
+            medicines_encountered = existing[0]
+            new_medicines = existing[1]
+            rcms_available = existing[2]
+            rcms_downloaded = existing[3]
+            new_rcms_downloaded = existing[4]
+            leaflets_available = existing[5]
+            leaflets_downloaded = existing[6]
+            new_leaflets_downloaded = existing[7]
+            runtime_seconds = existing[8]
+
         conn.execute(
             """
             INSERT INTO sweep_metrics (
