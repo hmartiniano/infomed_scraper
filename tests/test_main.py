@@ -291,12 +291,32 @@ def test_parse_cli_args(monkeypatch):
     """Test CLI argument parsing for multi-sweep flags."""
     monkeypatch.setattr(
         "sys.argv",
-        ["main.py", "--sweep-all", "--dispensa", "--cft", "--no-headless"],
+        [
+            "main.py",
+            "--sweep-all",
+            "--dispensa",
+            "--cft",
+            "--ff",
+            "--via",
+            "--grupo",
+            "--generico",
+            "--margem",
+            "--monit",
+            "--mmr-docs",
+            "--no-headless",
+        ],
     )
     args = parse_cli_args()
     assert args.sweep_all is True
     assert args.sweep_dispensa is True
     assert args.sweep_cft is True
+    assert args.sweep_ff is True
+    assert args.sweep_via is True
+    assert args.sweep_grupo is True
+    assert args.sweep_generico is True
+    assert args.sweep_margem is True
+    assert args.sweep_monit is True
+    assert args.sweep_mmr is True
     assert args.headless is False
 
 

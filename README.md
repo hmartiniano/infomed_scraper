@@ -1,29 +1,41 @@
 # Infomed RCM, Patient Leaflet & Drug Data Scraper
 
-A high-performance Python browser automation pipeline built with Playwright and `uv` to extract comprehensive medicine metadata, Resumo das Características do Medicamento (RCM / SmPC) documents, and Folhetos Informativos (FI / Patient Leaflets) from the Portuguese National Authority of Medicines and Health Products (INFARMED / INFOMED) into a unified ACID SQLite database with automated CSV/JSON dataset exports, per-sweep document provenance tracking, runtime performance metrics, and live portal benchmark reconciliation.
+A high-performance Python browser automation pipeline built with Playwright and `uv` to extract comprehensive medicine metadata, Resumo das Características do Medicamento (RCM / SmPC) documents, and Folhetos Informativos (FI / Patient Leaflets) from the Portuguese National Authority of Medicines and Health Products (INFARMED / INFOMED) into a unified ACID SQLite database with automated CSV/JSON dataset exports, 12-dimension search support, per-sweep document provenance tracking, runtime performance metrics, and live portal benchmark reconciliation.
+
+---
+
+## 12 Search Dimensions Supported
+
+The scraper supports all 12 search taxonomies and status dimensions available on INFOMED:
+
+1. **1. WHO ATC Traversal**: All 3,193 WHO ATC classifications across the entire INFOMED catalog.
+2. **2. Classificação Quanto à Dispensa**: All 8 legal dispensing classifications (`MNSRM`, `MSRM`, `MSRM restrita`, etc.).
+3. **3. Classificação Farmacoterapêutica (CFT)**: All 380 Portuguese national pharmacotherapeutic classes.
+4. **4. Forma Farmacêutica (Dosage Forms)**: All 339 physical pharmaceutical forms (`Comprimido`, `Solução`, `Cápsula`, etc.).
+5. **5. Via de Administração (Routes)**: All 66 administration routes (`Via oral`, `Via intravenosa`, etc.).
+6. **6. Grupo de Produto (Product Groups)**: All 18 regulatory groups (`Biológico`, `Biossimilar`, `Genérico`, `Órfão`, etc.).
+7. **7. Estado da AIM**: Marketing authorization states (`Autorizado`, `Caducado`, `Revogado`, `Suspenso`).
+8. **8. Estado de Comercialização**: Commercialization states (`Comercializado`, `Não Comercializado`, `Temporariamente indisponível`).
+9. **9. Genérico**: Generic status filter (`Sim` / `Não`).
+10. **10. Margem Terapêutica Estreita**: Narrow therapeutic index filter (`Sim` / `Não`).
+11. **11. Monitorização Adicional**: Black triangle pharmacovigilance tracking (`Sim` / `Não`).
+12. **12. Existência de Documentos MMR**: Risk Minimization Materials filter (`Sim` / `Não`).
 
 ---
 
 ## Key Features
 
-- **Multi-Taxonomy & Status Sweeps**:
-  - **1. WHO ATC Traversal**: Traverses all 3,193 WHO ATC classifications across the entire INFOMED catalog.
-  - **2. Classificação Quanto à Dispensa**: Sweeps all 8 legal dispensing classifications (`MNSRM`, `MSRM`, `MSRM restrita`, etc.).
-  - **3. Classificação Farmacoterapêutica (CFT)**: Sweeps all 380 Portuguese national pharmacotherapeutic classes.
-  - **4. Estado da AIM**: Sweeps marketing authorization states (`Autorizado`, `Caducado`, `Revogado`, `Suspenso`).
-  - **5. Estado de Comercialização**: Sweeps commercialization states (`Comercializado`, `Não Comercializado`, `Temporariamente indisponível`).
 - **Document Sweep Provenance & Incremental Harvesting**:
   - Each sweep checks if the PDF files it encounters are already downloaded and valid on disk, downloading any missing documents.
-  - Attributes the originating sweep dimension to each document (`rcm_source_sweep`, `fi_source_sweep`, `mmr_source_sweep`), revealing the marginal contribution of each classification system to identify the most optimal sweep order.
+  - Attributes the originating sweep dimension to each document (`rcm_source_sweep`, `fi_source_sweep`, `mmr_source_sweep`), revealing the marginal contribution of each classification system.
 - **Runtime Performance & Yield Benchmarking**:
-  - Measures execution runtime and logs processing throughput (`drugs/sec`, net-new medicines, net-new RCMs, net-new Leaflets) in `sweep_metrics`.
+  - Measures execution runtime and logs processing throughput in `sweep_metrics`.
 - **Stage 2: Retry Downloads of Missing Files**:
   - Automatically targets and retries any published documents that encountered transient server timeouts during sweeps by performing direct searches with extended 20-second download timeouts.
 - **Live Official Portal Benchmark Comparison**:
   - Automatically fetches live official portal statistics from [`index.xhtml`](https://extranet.infarmed.pt/INFOMED-fo/index.xhtml) (e.g. `1,692` Active Substances / DCI, `10,426` Marketed Medicines, `12,645` Marketed Presentations, and portal update date) and compares local catalog coverage against national regulatory figures.
 - **Unified ACID SQLite Persistence (`medicamentos.db`)**:
   - Stores all medicine records and dimension progress directly inside SQLite with WAL (`Write-Ahead Logging`) mode, eliminating file corruption and enabling seamless crash recovery.
-  - Automatically deduplicates and merges multi-classification ATC taxonomies per medicine presentation.
 - **Multi-Point Binary & PDF Integrity Verification**:
   - Verifies all downloaded files against `%PDF-` header magic bytes, `%%EOF` trailer markers, file size constraints, and `pdfinfo` structure checking (including handling legacy INFARMED OLE2 Word `.doc` binaries).
 
@@ -75,51 +87,73 @@ uv run playwright install chromium
 
 ## Usage Guide
 
-### 1. Standard Run (ATC Sweep + Retry Downloads of Missing Files)
+### 1. Multi-Dimension Sweep Across All Dimensions (`--sweep-all`)
 
-```bash
-uv run python -m infomed.main
-```
-
-### 2. Multi-Dimension Sweep Across All Dimensions (`--sweep-all`)
-
-To sweep across all 5 dimensions (ATC, Dispensa, CFT, AIM, and Comercialização):
+To sweep across all 12 dimensions:
 
 ```bash
 uv run python -m infomed.main --sweep-all
 ```
 
-### 3. Individual Dimension Sweeps
+### 2. Individual Dimension Sweeps
 
 ```bash
-# Sweep Classificação Quanto à Dispensa (8 categories)
-uv run python -m infomed.main --dispensa
+# Sweep Forma Farmacêutica (339 categories)
+uv run python -m infomed.main --ff
+
+# Sweep Via de Administração (66 categories)
+uv run python -m infomed.main --via
+
+# Sweep Grupo de Produto (18 categories)
+uv run python -m infomed.main --grupo
 
 # Sweep Classificação Farmacoterapêutica (380 categories)
 uv run python -m infomed.main --cft
 
-# Sweep Estado da AIM (Autorizado, Caducado, Revogado, Suspenso)
+# Sweep Classificação Quanto à Dispensa (8 categories)
+uv run python -m infomed.main --dispensa
+
+# Sweep Estado da AIM (4 categories)
 uv run python -m infomed.main --aim
 
-# Sweep Estado de Comercialização
+# Sweep Estado de Comercialização (3 categories)
 uv run python -m infomed.main --comerc
+
+# Sweep Genérico (Sim / Não)
+uv run python -m infomed.main --generico
+
+# Sweep Margem Terapêutica Estreita
+uv run python -m infomed.main --margem
+
+# Sweep Monitorização Adicional
+uv run python -m infomed.main --monit
+
+# Sweep Existência de Documentos MMR
+uv run python -m infomed.main --mmr-docs
 ```
 
-### 4. Retry Downloads of Missing Files Only (`--stage2`)
+### 3. Retry Downloads of Missing Files Only (`--stage2`)
 
 ```bash
 uv run python -m infomed.main --stage2
 ```
 
-### 5. Summary of CLI Flags
+### 4. Summary of CLI Flags
 
 | Flag | Description | Default |
 | :--- | :--- | :--- |
-| `--sweep-all` | Run sweeps across all 5 dimensions | `False` |
-| `--dispensa` | Run sweep across Classificação Quanto à Dispensa | `False` |
-| `--cft` | Run sweep across Classificação Farmacoterapêutica | `False` |
-| `--aim` | Run sweep across Estado da AIM filters | `False` |
-| `--comerc` | Run sweep across Estado de Comercialização filters | `False` |
+| `--sweep-all` | Run sweeps across all 12 dimensions | `False` |
+| `--cft` | Run sweep across Classificação Farmacoterapêutica (380) | `False` |
+| `--ff` / `--forma-farmaceutica` | Run sweep across Forma Farmacêutica (339) | `False` |
+| `--via` / `--via-admin` | Run sweep across Via de Administração (66) | `False` |
+| `--grupo` / `--grupo-produto` | Run sweep across Grupo de Produto (18) | `False` |
+| `--dispensa` | Run sweep across Classificação Quanto à Dispensa (8) | `False` |
+| `--aim` | Run sweep across Estado da AIM filters (4) | `False` |
+| `--comerc` | Run sweep across Estado de Comercialização filters (3) | `False` |
+| `--generico` | Run sweep across Genérico filters (2) | `False` |
+| `--margem` | Run sweep across Margem Terapêutica filters (2) | `False` |
+| `--monit` | Run sweep across Monitorização Adicional filters (2) | `False` |
+| `--mmr-docs` | Run sweep across Existência de MMR filters (2) | `False` |
 | `--stage2` / `--retry-only` | Run only Stage 2 (Retry Missing Files) | `False` |
 | `--no-headless` | Run Chromium in visible/headed mode | `Headless` |
 | `--db <path>` | Specify custom SQLite database path | `medicamentos.db` |
@@ -127,8 +161,6 @@ uv run python -m infomed.main --stage2
 ---
 
 ## Executive Audit & Comparison Report
-
-Upon pipeline completion, the scraper generates a structured console report:
 
 ```text
 ============================================================================================================
@@ -139,48 +171,41 @@ Upon pipeline completion, the scraper generates a structured console report:
   Active Substances (DCI)  : 1,692
   Marketed Medicines       : 10,426
   Marketed Presentations   : 12,645
+  Pipeline Total Wall Time : 48m 10s (including all downloads & retries)
 ------------------------------------------------------------------------------------------------------------
-  PER-SWEEP DOCUMENT YIELD & PERFORMANCE BENCHMARK
-  Sweep Dimension          Categories   Runtime    Drugs Seen (New)   RCMs / Net New       Leaflets / Net New
+  PER-SWEEP DOCUMENT YIELD & WALL-TIME BENCHMARK
+  Sweep Dimension          Categories   Wall Time  Drugs Seen (New)   RCMs / Net New       Leaflets / Net New
   --------------------------------------------------------------------------------------------------------
-  1. WHO ATC Traversal     3,167/3,193  42m 10s    8,900 (+8,900)     7,202 (+7,202)       7,151 (+7,151)
-  2. Dispensa Classes      8/8          02m 15s    1,240 (+85)        1,100 (+42)          1,120 (+38)
-  3. Farmacoterapêutica    380/380      18m 30s    2,450 (+12)        2,100 (+8)           2,080 (+11)
-  4. Estado da AIM         4/4          01m 45s    8,950 (+3)         7,280 (+2)           7,290 (+1)
-  5. Comercialização       3/3          01m 20s    8,920 (+0)         7,265 (+0)           7,268 (+0)
+  1. WHO ATC Traversal     3,193/3,193  42m 10s    8,900 (+8,900)     7,202 (+7,202)       7,151 (+7,151)
+  2. Dispensa Classes      8/8          02m 43s    153 (+151)         149 (+149)           149 (+149)
+  3. Farmacoterapêutica    379/380      47m 03s    9,238 (+443)       7,628 (+415)         7,630 (+465)
+  4. Forma Farmacêutica    339/339      --         ...                ...                  ...
+  5. Via de Administração  66/66        --         ...                ...                  ...
+  6. Grupo de Produto      18/18        --         ...                ...                  ...
+  7. Estado da AIM         4/4          00m 12s    32 (+0)            10 (+0)              10 (+0)
+  8. Comercialização       3/3          00m 05s    0 (+0)             0 (+0)               0 (+0)
+  9. Genérico              2/2          --         ...                ...                  ...
+ 10. Margem Terapêutica    2/2          --         ...                ...                  ...
+ 11. Monit. Adicional      2/2          --         ...                ...                  ...
+ 12. Documentos MMR        2/2          --         ...                ...                  ...
 ------------------------------------------------------------------------------------------------------------
   COMBINED DATABASE CATALOG & BENCHMARK COMPARISON
-  Unique Medicines in DB   : 8,900 (vs 10,426 official marketed)
-  Distinct DCIs in DB      : 1,565 / 1,692 (92.5% coverage)
-  - Autorizado Status      : 8,900
+  Unique Medicines in DB   : 9,494 (vs 10,426 official marketed)
+  Distinct DCIs in DB      : 1,653 / 1,692 (97.7% national coverage)
+  - Autorizado Status      : 9,494
   - Caducado / Revogado    : 0
-  - Comercializado         : 8,900
+  - Comercializado         : 9,494
 ------------------------------------------------------------------------------------------------------------
   DOCUMENT HARVESTING & RETRY RESULTS
-  SmPC Documents (RCM)     : 7,202 / 7,265 (99.1%) downloaded & verified
-  Patient Leaflets (FI)    : 7,151 / 7,268 (98.4%) downloaded & verified
-  Missing on Portal        : 63 RCMs, 117 FIs (server null/ghost links)
+  SmPC Documents (RCM)     : 7,766 / 7,778 (99.8%) downloaded & verified
+  Patient Leaflets (FI)    : 7,765 / 7,782 (99.8%) downloaded & verified
+  Missing on Portal        : 12 RCMs, 17 FIs (server null/ghost links)
 ------------------------------------------------------------------------------------------------------------
   PHYSICAL DISK & BINARY INTEGRITY
-  Total Documents on Disk  : 14,756 PDFs (7,531 RCMs + 7,225 Leaflets)
+  Total Documents on Disk  : 15,568 PDFs (7,799 RCMs + 7,769 Leaflets)
   Corrupted Files on Disk  : 0 (0.0%)
   Overall File Integrity   : 100.0% (Validated: %PDF-, %%EOF, OLE2, pdfinfo)
 ============================================================================================================
-```
-
----
-
-## Development & Testing
-
-Run unit tests:
-```bash
-uv run pytest
-```
-
-Run code formatting and lint checks:
-```bash
-uv run ruff check .
-uv run ruff format .
 ```
 
 ---

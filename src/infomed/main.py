@@ -59,11 +59,17 @@ CHROMIUM_LOW_MEM_ARGS = [
 
 # DOM Selectors on pesquisa-avancada.xhtml
 ATC_DROPDOWN_SELECTOR = "select[id='mainForm:classif-atc_input']"
-DISPENSA_DROPDOWN_SELECTOR = "select[id='mainForm:classif-dispensa_input']"
 CFT_DROPDOWN_SELECTOR = "select[id='mainForm:classif-farmacoterapeutica_input']"
+DISPENSA_DROPDOWN_SELECTOR = "select[id='mainForm:classif-dispensa_input']"
 AIM_DROPDOWN_SELECTOR = "select[id='mainForm:estado-aim_input']"
 COMERC_DROPDOWN_SELECTOR = "select[id='mainForm:estado-comercializacao_input']"
-
+FF_DROPDOWN_SELECTOR = "select[id='mainForm:ff_input']"
+VIAS_ADMIN_DROPDOWN_SELECTOR = "select[id='mainForm:vias-admin_input']"
+GRUPO_PRODUTO_DROPDOWN_SELECTOR = "select[id='mainForm:grupo-produto_input']"
+GENERICO_DROPDOWN_SELECTOR = "select[id='mainForm:generico_input']"
+MARGEM_TERAP_DROPDOWN_SELECTOR = "select[id='mainForm:margem-terap_input']"
+MONIT_ADICIONAL_DROPDOWN_SELECTOR = "select[id='mainForm:monit-adicional_input']"
+EXIST_MMR_DROPDOWN_SELECTOR = "select[id='mainForm:exist-docs-mmr_input']"
 SEARCH_BUTTON_SELECTOR = "button[id='mainForm:btnDoSearch']"
 RESULTS_TABLE_SELECTOR = "div[id='mainForm:dt-medicamentos']"
 TABLE_BODY_SELECTOR = "tbody[id='mainForm:dt-medicamentos_data']"
@@ -148,51 +154,32 @@ def init_db(db_path: str = DB_PATH, auto_migrate: bool = True) -> None:
             );
             """
         )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS atc_progress (
-                atc_code TEXT PRIMARY KEY,
-                atc_label TEXT,
-                processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS dispensa_progress (
-                dispensa_code TEXT PRIMARY KEY,
-                dispensa_label TEXT,
-                processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS cft_progress (
-                cft_code TEXT PRIMARY KEY,
-                cft_label TEXT,
-                processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS aim_progress (
-                aim_code TEXT PRIMARY KEY,
-                aim_label TEXT,
-                processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS comerc_progress (
-                comerc_code TEXT PRIMARY KEY,
-                comerc_label TEXT,
-                processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            """
-        )
+        # Create dimension progress tables
+        for table_name in (
+            "atc_progress",
+            "dispensa_progress",
+            "cft_progress",
+            "aim_progress",
+            "comerc_progress",
+            "ff_progress",
+            "via_progress",
+            "grupo_progress",
+            "generico_progress",
+            "margem_progress",
+            "monit_progress",
+            "mmr_doc_progress",
+        ):
+            col_name = table_name.replace("_progress", "_code")
+            lbl_col = table_name.replace("_progress", "_label")
+            conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {table_name} (
+                    {col_name} TEXT PRIMARY KEY,
+                    {lbl_col} TEXT,
+                    processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """
+            )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS sweep_metrics (
@@ -1691,8 +1678,15 @@ def retrieve_infomed_rcms(
     sweep_all: bool = False,
     sweep_dispensa: bool = False,
     sweep_cft: bool = False,
+    sweep_ff: bool = False,
+    sweep_via: bool = False,
+    sweep_grupo: bool = False,
     sweep_aim: bool = False,
     sweep_comerc: bool = False,
+    sweep_generico: bool = False,
+    sweep_margem: bool = False,
+    sweep_monit: bool = False,
+    sweep_mmr: bool = False,
 ) -> Dict[str, Any]:
     """Retrieve all RCMs, Leaflets, and metadata with multi-sweep support.
 
@@ -1700,11 +1694,18 @@ def retrieve_infomed_rcms(
         headless: Whether to run Playwright in headless mode.
         db_path: Path to SQLite database file.
         stage_2_only: Whether to skip sweeps and run only Stage 2 targeted retry.
-        sweep_all: Run full sweep across all 5 classification dimensions.
-        sweep_dispensa: Sweep Dispensa classifications.
-        sweep_cft: Sweep Farmacoterapeutica classifications.
-        sweep_aim: Sweep Estado da AIM filters.
-        sweep_comerc: Sweep Estado de Comercializacao filters.
+        sweep_all: Run full sweep across all 12 classification dimensions.
+        sweep_dispensa: Sweep Dispensa classifications (8 categories).
+        sweep_cft: Sweep Farmacoterapêutica classifications (380 categories).
+        sweep_ff: Sweep Forma Farmacêutica classifications (339 categories).
+        sweep_via: Sweep Via de Administração classifications (66 categories).
+        sweep_grupo: Sweep Grupo de Produto classifications (18 categories).
+        sweep_aim: Sweep Estado da AIM filters (4 categories).
+        sweep_comerc: Sweep Estado de Comercialização filters (3 categories).
+        sweep_generico: Sweep Genérico filters (2 categories).
+        sweep_margem: Sweep Margem Terapêutica filters (2 categories).
+        sweep_monit: Sweep Monitorização Adicional filters (2 categories).
+        sweep_mmr: Sweep Existência de MMR filters (2 categories).
 
     Returns:
         Audit report dict summarizing scraped data and file integrity.
@@ -1778,10 +1779,55 @@ def retrieve_infomed_rcms(
                     downloaded_files=downloaded_files,
                 )
 
-            # Dimension 4: Estado da AIM
+            # Dimension 4: Forma Farmacêutica (FF)
+            if sweep_all or sweep_ff:
+                browser, context, page = run_dimension_sweep(
+                    sweep_name="4. Forma Farmacêutica",
+                    selector=FF_DROPDOWN_SELECTOR,
+                    progress_table="ff_progress",
+                    browser=browser,
+                    context=context,
+                    page=page,
+                    p=p,
+                    db_path=db_path,
+                    headless=headless,
+                    downloaded_files=downloaded_files,
+                )
+
+            # Dimension 5: Via de Administração
+            if sweep_all or sweep_via:
+                browser, context, page = run_dimension_sweep(
+                    sweep_name="5. Via de Administração",
+                    selector=VIAS_ADMIN_DROPDOWN_SELECTOR,
+                    progress_table="via_progress",
+                    browser=browser,
+                    context=context,
+                    page=page,
+                    p=p,
+                    db_path=db_path,
+                    headless=headless,
+                    downloaded_files=downloaded_files,
+                )
+
+            # Dimension 6: Grupo de Produto
+            if sweep_all or sweep_grupo:
+                browser, context, page = run_dimension_sweep(
+                    sweep_name="6. Grupo de Produto",
+                    selector=GRUPO_PRODUTO_DROPDOWN_SELECTOR,
+                    progress_table="grupo_progress",
+                    browser=browser,
+                    context=context,
+                    page=page,
+                    p=p,
+                    db_path=db_path,
+                    headless=headless,
+                    downloaded_files=downloaded_files,
+                )
+
+            # Dimension 7: Estado da AIM
             if sweep_all or sweep_aim:
                 browser, context, page = run_dimension_sweep(
-                    sweep_name="4. Estado da AIM",
+                    sweep_name="7. Estado da AIM",
                     selector=AIM_DROPDOWN_SELECTOR,
                     progress_table="aim_progress",
                     browser=browser,
@@ -1793,12 +1839,72 @@ def retrieve_infomed_rcms(
                     downloaded_files=downloaded_files,
                 )
 
-            # Dimension 5: Estado de Comercialização
+            # Dimension 8: Estado de Comercialização
             if sweep_all or sweep_comerc:
                 browser, context, page = run_dimension_sweep(
-                    sweep_name="5. Comercialização",
+                    sweep_name="8. Comercialização",
                     selector=COMERC_DROPDOWN_SELECTOR,
                     progress_table="comerc_progress",
+                    browser=browser,
+                    context=context,
+                    page=page,
+                    p=p,
+                    db_path=db_path,
+                    headless=headless,
+                    downloaded_files=downloaded_files,
+                )
+
+            # Dimension 9: Genérico (Sim / Não)
+            if sweep_all or sweep_generico:
+                browser, context, page = run_dimension_sweep(
+                    sweep_name="9. Genérico",
+                    selector=GENERICO_DROPDOWN_SELECTOR,
+                    progress_table="generico_progress",
+                    browser=browser,
+                    context=context,
+                    page=page,
+                    p=p,
+                    db_path=db_path,
+                    headless=headless,
+                    downloaded_files=downloaded_files,
+                )
+
+            # Dimension 10: Margem Terapêutica Estreita
+            if sweep_all or sweep_margem:
+                browser, context, page = run_dimension_sweep(
+                    sweep_name="10. Margem Terapêutica",
+                    selector=MARGEM_TERAP_DROPDOWN_SELECTOR,
+                    progress_table="margem_progress",
+                    browser=browser,
+                    context=context,
+                    page=page,
+                    p=p,
+                    db_path=db_path,
+                    headless=headless,
+                    downloaded_files=downloaded_files,
+                )
+
+            # Dimension 11: Monitorização Adicional
+            if sweep_all or sweep_monit:
+                browser, context, page = run_dimension_sweep(
+                    sweep_name="11. Monit. Adicional",
+                    selector=MONIT_ADICIONAL_DROPDOWN_SELECTOR,
+                    progress_table="monit_progress",
+                    browser=browser,
+                    context=context,
+                    page=page,
+                    p=p,
+                    db_path=db_path,
+                    headless=headless,
+                    downloaded_files=downloaded_files,
+                )
+
+            # Dimension 12: Existência de Documentos MMR
+            if sweep_all or sweep_mmr:
+                browser, context, page = run_dimension_sweep(
+                    sweep_name="12. Documentos MMR",
+                    selector=EXIST_MMR_DROPDOWN_SELECTOR,
+                    progress_table="mmr_doc_progress",
                     browser=browser,
                     context=context,
                     page=page,
@@ -1865,7 +1971,7 @@ def parse_cli_args() -> argparse.Namespace:
         "--sweep-all",
         action="store_true",
         dest="sweep_all",
-        help="Execute sweeps across all dimensions (ATC, Dispensa, CFT, AIM, Comerc).",
+        help="Execute sweeps across all 12 dimensions.",
     )
     parser.add_argument(
         "--dispensa",
@@ -1880,16 +1986,61 @@ def parse_cli_args() -> argparse.Namespace:
         help="Execute sweep across Classificação Farmacoterapêutica (380 categories).",
     )
     parser.add_argument(
+        "--ff",
+        "--forma-farmaceutica",
+        action="store_true",
+        dest="sweep_ff",
+        help="Execute sweep across Forma Farmacêutica (339 categories).",
+    )
+    parser.add_argument(
+        "--via",
+        "--via-admin",
+        action="store_true",
+        dest="sweep_via",
+        help="Execute sweep across Via de Administração (66 categories).",
+    )
+    parser.add_argument(
+        "--grupo",
+        "--grupo-produto",
+        action="store_true",
+        dest="sweep_grupo",
+        help="Execute sweep across Grupo de Produto (18 categories).",
+    )
+    parser.add_argument(
         "--aim",
         action="store_true",
         dest="sweep_aim",
-        help="Execute sweep across Estado da AIM filters (Autorizado, Caducado, etc.).",
+        help="Execute sweep across Estado da AIM filters (4 categories).",
     )
     parser.add_argument(
         "--comerc",
         action="store_true",
         dest="sweep_comerc",
-        help="Execute sweep across Estado de Comercialização filters.",
+        help="Execute sweep across Estado de Comercialização filters (3 categories).",
+    )
+    parser.add_argument(
+        "--generico",
+        action="store_true",
+        dest="sweep_generico",
+        help="Execute sweep across Genérico (Sim/Não) filters (2 categories).",
+    )
+    parser.add_argument(
+        "--margem",
+        action="store_true",
+        dest="sweep_margem",
+        help="Execute sweep across Margem Terapêutica filters (2 categories).",
+    )
+    parser.add_argument(
+        "--monit",
+        action="store_true",
+        dest="sweep_monit",
+        help="Execute sweep across Monitorização Adicional filters (2 categories).",
+    )
+    parser.add_argument(
+        "--mmr-docs",
+        action="store_true",
+        dest="sweep_mmr",
+        help="Execute sweep across Documentos MMR filters (2 categories).",
     )
     parser.add_argument(
         "--no-headless",
@@ -1915,6 +2066,13 @@ if __name__ == "__main__":
         sweep_all=args.sweep_all,
         sweep_dispensa=args.sweep_dispensa,
         sweep_cft=args.sweep_cft,
+        sweep_ff=args.sweep_ff,
+        sweep_via=args.sweep_via,
+        sweep_grupo=args.sweep_grupo,
         sweep_aim=args.sweep_aim,
         sweep_comerc=args.sweep_comerc,
+        sweep_generico=args.sweep_generico,
+        sweep_margem=args.sweep_margem,
+        sweep_monit=args.sweep_monit,
+        sweep_mmr=args.sweep_mmr,
     )
