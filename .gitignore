@@ -10,3 +10,5 @@ wget-log*
 *.db
 medicamentos.json
 medicamentos.csv
+*.tar.gz
+*.tar
