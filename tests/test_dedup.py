@@ -5,9 +5,38 @@ import numpy as np
 from infomed.dedup import (
     compute_similarity_matrix,
     deduplicate_substance,
+    extract_clinical_sections_text,
     normalize_rcm_text,
     scan_pgx_markers,
 )
+
+
+def test_extract_clinical_sections_text():
+    """Test isolation of Section 4 and 5 from full RCM text."""
+    raw_doc = (
+        "1. NOME DO MEDICAMENTO\n"
+        "Clopidogrel Generis 75 mg Comprimidos\n"
+        "2. COMPOSIÇÃO QUALITATIVA E QUANTITATIVA\n"
+        "Contém lactose monohidratada.\n"
+        "3. FORMA FARMACÊUTICA\n"
+        "Comprimido revestido por película.\n"
+        "4. INFORMAÇÕES CLÍNICAS\n"
+        "4.1 Indicações terapêuticas: Prevenção de eventos aterotrombóticos.\n"
+        "4.2 Posologia: 75 mg uma vez por dia.\n"
+        "5. PROPRIEDADES FARMACOLÓGICAS\n"
+        "5.1 Propriedades farmacodinâmicas: Inibidor da agregação plaquetária.\n"
+        "5.2 Propriedades farmacocinéticas: Metabolizado pelo CYP2C19.\n"
+        "6. INFORMAÇÕES FARMACÊUTICAS\n"
+        "6.1 Lista dos excipientes: Celulose microcristalina.\n"
+        "7. TITULAR DA AIM\n"
+        "Generis Farmacêutica, S.A.\n"
+    )
+    clinical = extract_clinical_sections_text(raw_doc)
+    assert "prevenção de eventos aterotrombóticos" in clinical
+    assert "metabolizado pelo cyp2c19" in clinical
+    assert "clopidogrel generis 75 mg comprimidos" not in clinical
+    assert "lactose monohidratada" not in clinical
+    assert "generis farmacêutica" not in clinical
 
 
 def test_normalize_rcm_text():

@@ -1,7 +1,7 @@
 """RCM Deduplication and Pharmacogenomics (PGx) Analysis Engine for INFOMED.
 
-This module provides text extraction, pairwise TF-IDF similarity calculation,
-pharmacogenomic marker detection (CYP enzymes, HLA alleles, DPYD, TPMT, etc.),
+This module provides text extraction, clinical section isolation (Sections 4 & 5),
+pairwise TF-IDF similarity calculation, pharmacogenomic marker detection,
 and conservative deduplication for Summary of Product Characteristics (RCM / SmPC)
 documents belonging to the same active substance.
 """
@@ -84,14 +84,54 @@ PGX_TERM_PATTERNS = {
 }
 
 
-def extract_rcm_text(pdf_path: str) -> str:
-    """Extract and normalize plain text from an RCM PDF file.
+def extract_clinical_sections_text(raw_text: str) -> str:
+    """Isolate Sections 4 (Clinical Particulars) and 5 (Pharmacology) from an RCM.
 
-    Uses `pdftotext` (Poppler) when available for fast and layout-aware
-    extraction, falling back to `pypdf.PdfReader` if needed.
+    Strips Section 1 (Brand Names), Section 2 (Composition), Section 3 (Form),
+    Section 6 (Excipient/Storage), and Sections 7-10 (MAH address and admin).
+
+    Args:
+        raw_text: Raw text string extracted directly from PDF.
+
+    Returns:
+        Isolated text of Sections 4 and 5, or full normalized text if boundaries
+        cannot be determined.
+
+    """
+    if not raw_text:
+        return ""
+
+    # Regex for start of Section 4 (Clinical Particulars)
+    sec4_match = re.search(
+        r"(?:(?:^|\n)\s*4\.\s*INFORMAÇÕES\s+CLÍNICAS|(?:^|\n)\s*4\.1\s*Indicações)",
+        raw_text,
+        re.IGNORECASE,
+    )
+    # Regex for start of Section 6 or 7 (End of Section 5)
+    sec6_match = re.search(
+        r"(?:(?:^|\n)\s*6\.\s*INFORMAÇÕES\s+FARMACÊUTICAS|"
+        r"(?:^|\n)\s*6\.\s*DADOS\s+FARMACÊUTICOS|"
+        r"(?:^|\n)\s*6\.1\s*Lista\s+dos\s+excipientes|"
+        r"(?:^|\n)\s*7\.\s*TITULAR)",
+        raw_text,
+        re.IGNORECASE,
+    )
+
+    if sec4_match and sec6_match and sec6_match.start() > sec4_match.start():
+        clinical_substring = raw_text[sec4_match.start() : sec6_match.start()]
+        return normalize_rcm_text(clinical_substring)
+
+    # Fallback to full normalized text if regex boundary fails
+    return normalize_rcm_text(raw_text)
+
+
+def extract_rcm_text(pdf_path: str, clinical_only: bool = True) -> str:
+    """Extract and normalize text from an RCM PDF file.
 
     Args:
         pdf_path: Absolute or relative path to the PDF file.
+        clinical_only: If True, extracts only Sections 4 & 5 (Clinical Particulars
+            and Pharmacology). If False, extracts the full document.
 
     Returns:
         Normalized text content extracted from the PDF.
@@ -127,6 +167,8 @@ def extract_rcm_text(pdf_path: str) -> str:
             logger.error(f"Failed to extract text from {pdf_path}: {err}")
             return ""
 
+    if clinical_only:
+        return extract_clinical_sections_text(raw_text)
     return normalize_rcm_text(raw_text)
 
 
@@ -305,10 +347,9 @@ def deduplicate_substance(
     rcms_dir: str = RCMS_DIR,
     threshold: float = 0.85,
     seed: int = 42,
+    clinical_only: bool = True,
 ) -> Dict[str, Any]:
     """Evaluate text similarity and apply Option-B deduplication for one substance.
-
-    Also executes pharmacogenomic (PGx) marker extraction on all documents.
 
     Args:
         substance_name: Name of the active substance.
@@ -316,6 +357,7 @@ def deduplicate_substance(
         rcms_dir: Path to directory containing RCM PDFs.
         threshold: Minimum pairwise similarity required to collapse (default: 0.85).
         seed: Random seed for reproducible selection (default: 42).
+        clinical_only: If True, restricts similarity to Sections 4 & 5 (default: True).
 
     Returns:
         Dictionary containing evaluation metrics, pairwise similarity matrix,
@@ -326,7 +368,6 @@ def deduplicate_substance(
     n_docs = len(rcm_records)
 
     if n_docs == 0:
-        # Check if medicine is in DB (e.g. Siponimod / Mayzent without local RCM)
         is_registered = False
         sample_mah = None
         if os.path.exists(db_path):
@@ -373,7 +414,7 @@ def deduplicate_substance(
     extracted_texts = []
     doc_pgx_profiles = []
     for r in rcm_records:
-        text = extract_rcm_text(r["pdf_path"])
+        text = extract_rcm_text(r["pdf_path"], clinical_only=clinical_only)
         extracted_texts.append(text)
         pgx = scan_pgx_markers(text)
         doc_pgx_profiles.append(pgx)
@@ -421,7 +462,6 @@ def deduplicate_substance(
 
     is_homogeneous = min_sim >= threshold
 
-    # Aggregate substance-level PGx profile
     substance_genes = sorted(list(set(g for p in doc_pgx_profiles for g in p["genes"])))
     substance_phenotypes = sorted(
         list(set(ph for p in doc_pgx_profiles for ph in p["phenotypes"]))
@@ -453,6 +493,7 @@ def deduplicate_substance(
     return {
         "substance": substance_name,
         "doc_count": n_docs,
+        "mode": "clinical_sections_4_and_5" if clinical_only else "full_document",
         "decision": decision,
         "is_homogeneous": is_homogeneous,
         "min_similarity": round(min_sim, 4),
@@ -492,12 +533,12 @@ def run_pilot_evaluation(
     rcms_dir: str = RCMS_DIR,
     threshold: float = 0.85,
     seed: int = 42,
-    output_json: Optional[str] = "pilot_dedup_results.json",
+    output_json: Optional[str] = "clinical_sections_pilot_results.json",
 ) -> List[Dict[str, Any]]:
-    """Run pilot evaluation on a list of active substances and print report.
+    """Run comparative evaluation comparing Full-Text vs Clinical-Sections.
 
     Args:
-        sample_substances: List of substances to evaluate (uses defaults if None).
+        sample_substances: List of substances to evaluate.
         db_path: Path to database file.
         rcms_dir: Path to RCM files directory.
         threshold: Homogeneity threshold (default: 0.85).
@@ -526,73 +567,78 @@ def run_pilot_evaluation(
         ]
 
     results = []
-    print("\n" + "=" * 115)
-    print("      RCM SIMILARITY & PHARMACOGENOMICS (PGX) COMPREHENSIVE PILOT REPORT")
-    print("=" * 115)
+    print("\n" + "=" * 120)
+    print("   RCM SIMILARITY: FULL DOC vs CLINICAL SECTIONS (4 & 5 ONLY) COMPARISON")
+    print("=" * 120)
     print(
         f"Config: Homogeneity Threshold = {threshold:.2f} | Random Seed = {seed} | "
-        f"Substances Tested = {len(sample_substances)}"
+        f"Substances = {len(sample_substances)}"
     )
-    print("-" * 115)
+    print("-" * 120)
     print(
-        f"{'Active Substance':<16} {'RCMs':<5} {'Min/Mean Sim':<14} "
-        f"{'Decision':<24} {'PGx Genes / Biomarkers':<30} {'PGx Phenotypes'}"
+        f"{'Active Substance':<16} {'RCMs':<5} {'Full Doc (Min/Mean)':<22} "
+        f"{'Clinical 4&5 (Min/Mean)':<25} {'Clinical Decision':<24} {'PGx Markers'}"
     )
-    print("-" * 115)
+    print("-" * 120)
 
     for sub in sample_substances:
-        res = deduplicate_substance(
+        # Full text mode
+        res_full = deduplicate_substance(
             substance_name=sub,
             db_path=db_path,
             rcms_dir=rcms_dir,
             threshold=threshold,
             seed=seed,
+            clinical_only=False,
         )
-        results.append(res)
+        # Clinical sections mode
+        res_clin = deduplicate_substance(
+            substance_name=sub,
+            db_path=db_path,
+            rcms_dir=rcms_dir,
+            threshold=threshold,
+            seed=seed,
+            clinical_only=True,
+        )
 
-        n_docs = res["doc_count"]
+        combined = {
+            "substance": sub,
+            "doc_count": res_clin["doc_count"],
+            "full_document": res_full,
+            "clinical_sections": res_clin,
+        }
+        results.append(combined)
+
+        n_docs = res_clin["doc_count"]
         if n_docs == 0:
-            sim_str = "N/A"
-            dec = res["decision"]
-            genes_str = "EMA CAP (on EMA EPAR)"
-            pheno_str = "CYP2C9*3 (EU SmPC)"
+            full_str = "N/A"
+            clin_str = "N/A"
+            dec = res_clin["decision"]
+            pgx_str = "EMA CAP (EPAR)"
         else:
-            sim_str = f"{res['min_similarity']:.2f} / {res['mean_similarity']:.2f}"
-            dec = res["decision"]
-            pgx = res.get("pgx_profile", {})
-            genes_str = ", ".join(pgx.get("genes", [])) or "None detected"
-            pheno_str = (
-                ", ".join(
-                    [p.replace("Metabolizador ", "") for p in pgx.get("phenotypes", [])]
-                )
-                or "-"
+            full_str = (
+                f"{res_full['min_similarity']:.2f} / {res_full['mean_similarity']:.2f}"
             )
+            clin_str = (
+                f"{res_clin['min_similarity']:.2f} / {res_clin['mean_similarity']:.2f}"
+            )
+            dec = res_clin["decision"]
+            pgx = res_clin.get("pgx_profile", {})
+            pgx_str = ", ".join(pgx.get("genes", [])) or "None"
 
         print(
-            f"{sub:<16} {n_docs:<5} {sim_str:<14} {dec:<24} {genes_str:<30} {pheno_str}"
+            f"{sub:<16} {n_docs:<5} {full_str:<22} {clin_str:<25} {dec:<24} {pgx_str}"
         )
 
-    print("=" * 115 + "\n")
-
-    # Print detailed PGx excerpts for key positive substances
-    print("-" * 115)
-    print("               SAMPLE EXTRACTED PHARMACOGENOMIC (PGX) REGULATORY SNIPPETS")
-    print("-" * 115)
-    for res in results:
-        sub = res["substance"]
-        pgx = res.get("pgx_profile", {})
-        snippets = pgx.get("snippets", [])
-        if snippets:
-            print(f"\n[+] {sub.upper()} (Genes: {', '.join(pgx.get('genes', []))}):")
-            for s in snippets[:2]:
-                print(f'    - "{s}"')
-    print("\n" + "=" * 115 + "\n")
+    print("=" * 120 + "\n")
 
     if output_json:
         try:
             with open(output_json, "w", encoding="utf-8") as f:
                 json.dump(results, f, indent=2, ensure_ascii=False)
-            logger.info(f"Saved PGx and dedup evaluation results to '{output_json}'.")
+            logger.info(
+                f"Saved clinical sections comparison results to '{output_json}'."
+            )
         except Exception as err:
             logger.error(f"Failed to save JSON results: {err}")
 
@@ -602,12 +648,21 @@ def run_pilot_evaluation(
 def main() -> None:
     """CLI entrypoint for RCM deduplication and PGx analysis."""
     parser = argparse.ArgumentParser(
-        description="INFOMED RCM Text Similarity & Pharmacogenomics (PGx) Tool"
+        description="INFOMED RCM Text Similarity & Clinical Section Extraction"
     )
     parser.add_argument(
         "--substance",
         type=str,
         help="Evaluate a single active substance (e.g. --substance Clopidogrel)",
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["clinical", "full"],
+        default="clinical",
+        help=(
+            "Similarity mode: 'clinical' (Sections 4 & 5) or 'full' (default: clinical)"
+        ),
     )
     parser.add_argument(
         "--threshold",
@@ -624,13 +679,13 @@ def main() -> None:
     parser.add_argument(
         "--pilot",
         action="store_true",
-        help="Run pilot evaluation on representative sample active substances",
+        help="Run comparative pilot evaluation (Full Doc vs Clinical Sections)",
     )
     parser.add_argument(
         "--output",
         type=str,
-        default="pgx_evaluation_report.json",
-        help="Output JSON file for results (default: pgx_evaluation_report.json)",
+        default="clinical_sections_pilot_results.json",
+        help="Output JSON file for results",
     )
     args = parser.parse_args()
 
@@ -639,6 +694,7 @@ def main() -> None:
             substance_name=args.substance,
             threshold=args.threshold,
             seed=args.seed,
+            clinical_only=(args.mode == "clinical"),
         )
         print(json.dumps(res, indent=2, ensure_ascii=False))
     else:
