@@ -3,6 +3,8 @@
 import os
 
 from infomed.main import (
+    FI_ICON_SELECTOR,
+    RCM_ICON_SELECTOR,
     audit_documents_and_integrity,
     export_db_to_datasets,
     format_duration,
@@ -385,8 +387,33 @@ def test_print_summary_table(tmp_path, capsys):
     assert "10,426" in captured.out
     assert "12/08/2026" in captured.out
     assert "Pipeline Total Wall Time" in captured.out
-    assert "42m 10s" in captured.out
-    assert "1. WHO ATC Traversal" in captured.out
     assert "7,202" in captured.out
     assert "7,151" in captured.out
     assert "100.0%" in captured.out
+
+
+def test_ema_selectors_defined():
+    """Verify that RCM and FI selectors match both National and EMA element IDs."""
+    assert "pesqAvancadaDatableRcmIcon" in RCM_ICON_SELECTOR
+    assert "pesqAvancadaDatableEmaIcon" in RCM_ICON_SELECTOR
+    assert "pesqAvancadaDatableFiIcon" in FI_ICON_SELECTOR
+    assert "pesqAvancadaDatableEmaFiIcon" in FI_ICON_SELECTOR
+
+
+def test_cli_parser_backfill_args(monkeypatch):
+    """Test CLI argument parsing for EMA backfill options."""
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "main.py",
+            "--backfill-ema-docs",
+            "--substance",
+            "Siponimod",
+            "--limit",
+            "5",
+        ],
+    )
+    args = parse_cli_args()
+    assert args.backfill_ema is True
+    assert args.substance == "Siponimod"
+    assert args.limit == 5

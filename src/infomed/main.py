@@ -75,8 +75,12 @@ RESULTS_TABLE_SELECTOR = "div[id='mainForm:dt-medicamentos']"
 TABLE_BODY_SELECTOR = "tbody[id='mainForm:dt-medicamentos_data']"
 NEXT_PAGE_SELECTOR = "a.ui-paginator-next"
 DISABLED_NEXT_PAGE_SELECTOR = "a.ui-paginator-next.ui-state-disabled"
-RCM_ICON_SELECTOR = "a[id*='pesqAvancadaDatableRcmIcon']"
-FI_ICON_SELECTOR = "a[id*='pesqAvancadaDatableFiIcon']"
+RCM_ICON_SELECTOR = (
+    "a[id*='pesqAvancadaDatableRcmIcon'], a[id*='pesqAvancadaDatableEmaIcon']"
+)
+FI_ICON_SELECTOR = (
+    "a[id*='pesqAvancadaDatableFiIcon'], a[id*='pesqAvancadaDatableEmaFiIcon']"
+)
 MMR_ICON_SELECTOR = "a[id*='pesqAvancadaDatableMmrIcon']"
 DRUG_NAME_INPUT_SELECTOR = "input[id='mainForm:medicamento_input']"
 REG_NUMBER_INPUT_SELECTOR = "input[id='mainForm:numero-registro']"
@@ -1275,6 +1279,135 @@ def retry_missing_documents(
     return recovered_rcms, recovered_fis
 
 
+def backfill_ema_and_missing_documents(
+    page: Page,
+    db_path: str = DB_PATH,
+    target_url: str = TARGET_URL,
+    download_dir_rcms: str = DOWNLOAD_DIR_RCMS,
+    download_dir_leaflets: str = DOWNLOAD_DIR_LEAFLETS,
+    download_dir_mmr: str = DOWNLOAD_DIR_MMR,
+    limit: Optional[int] = None,
+    substance: Optional[str] = None,
+) -> Tuple[int, int]:
+    """Search and download missing EMA and National documents.
+
+    Queries medicines that currently lack RCMs or Leaflets on INFOMED,
+    captures EMA CAP icons or National icons, downloads PDFs, and updates SQLite.
+    """
+    with sqlite3.connect(db_path, timeout=30.0) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        if substance:
+            cursor.execute(
+                """
+                SELECT DISTINCT drug_name, med_id, active_substance
+                FROM medicamentos
+                WHERE (has_rcm = 0 OR has_fi = 0
+                       OR rcm_downloaded = 0 OR fi_downloaded = 0)
+                  AND LOWER(active_substance) LIKE LOWER(?)
+                ORDER BY drug_name
+                """,
+                (f"%{substance}%",),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT DISTINCT drug_name, med_id, active_substance
+                FROM medicamentos
+                WHERE (has_rcm = 0 OR has_fi = 0
+                       OR rcm_downloaded = 0 OR fi_downloaded = 0)
+                ORDER BY drug_name
+                """
+            )
+        rows = [dict(r) for r in cursor.fetchall()]
+
+    if limit:
+        rows = rows[:limit]
+
+    logger.info(
+        f"EMA Backfill: Found {len(rows)} distinct drug names to search on INFOMED."
+    )
+    if not rows:
+        return 0, 0
+
+    recovered_rcms = 0
+    recovered_fis = 0
+    downloaded_files: Set[str] = set()
+    for d in (download_dir_rcms, download_dir_leaflets, download_dir_mmr):
+        if os.path.exists(d):
+            for fname in os.listdir(d):
+                if fname.lower().endswith(".pdf") or fname.lower().endswith(".doc"):
+                    downloaded_files.add(fname)
+
+    for idx, item in enumerate(rows, 1):
+        drug_name = item.get("drug_name", "").strip()
+        med_id = item.get("med_id", "").strip()
+        search_term = drug_name if drug_name else med_id
+
+        if not search_term:
+            continue
+
+        logger.info(
+            f"[{idx}/{len(rows)}] Searching '{search_term}' "
+            "for EMA / missing documents..."
+        )
+
+        try:
+            if "pesquisa-avancada.xhtml" not in page.url:
+                page.goto(target_url, wait_until="domcontentloaded", timeout=25000)
+            page.wait_for_selector(
+                DRUG_NAME_INPUT_SELECTOR, state="attached", timeout=15000
+            )
+
+            name_input = page.locator(DRUG_NAME_INPUT_SELECTOR)
+            name_input.click()
+            name_input.fill(search_term)
+            time.sleep(0.3)
+
+            search_btn = page.locator(SEARCH_BUTTON_SELECTOR)
+            search_btn.click()
+            page.wait_for_selector(TABLE_BODY_SELECTOR, timeout=20000)
+            time.sleep(1.0)
+
+            # Extract rows returned
+            table_rows = page.locator(f"{TABLE_BODY_SELECTOR} tr")
+            row_count = table_rows.count()
+            if row_count == 0:
+                continue
+
+            extracted_records = []
+            for r_idx in range(row_count):
+                row_el = table_rows.nth(r_idx)
+                rec = extract_medicine_row(
+                    row=row_el,
+                    atc=None,
+                    page=page,
+                    sweep_name="EMA CAP Backfill",
+                    download_dir_rcms=download_dir_rcms,
+                    download_dir_leaflets=download_dir_leaflets,
+                    download_dir_mmr=download_dir_mmr,
+                    downloaded_files=downloaded_files,
+                )
+                if rec:
+                    extracted_records.append(rec)
+                    if rec.get("rcm_downloaded"):
+                        recovered_rcms += 1
+                    if rec.get("fi_downloaded"):
+                        recovered_fis += 1
+
+            if extracted_records:
+                upsert_medicamentos_batch(extracted_records, db_path=db_path)
+
+        except Exception as err:
+            logger.warning(f"Error backfilling '{search_term}': {err}")
+
+    logger.info(
+        f"EMA Backfill finished: Downloaded {recovered_rcms} RCMs and "
+        f"{recovered_fis} FIs."
+    )
+    return recovered_rcms, recovered_fis
+
+
 def audit_documents_and_integrity(
     medicines: Dict[str, Dict[str, Any]],
     download_dir_rcms: str = DOWNLOAD_DIR_RCMS,
@@ -1718,6 +1851,9 @@ def retrieve_infomed_rcms(
     sweep_margem: bool = False,
     sweep_monit: bool = False,
     sweep_mmr: bool = False,
+    backfill_ema: bool = False,
+    substance: Optional[str] = None,
+    limit: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Retrieve all RCMs, Leaflets, and metadata with multi-sweep support.
 
@@ -1737,6 +1873,9 @@ def retrieve_infomed_rcms(
         sweep_margem: Sweep Margem Terapêutica filters (2 categories).
         sweep_monit: Sweep Monitorização Adicional filters (2 categories).
         sweep_mmr: Sweep Existência de MMR filters (2 categories).
+        backfill_ema: Backfill missing EMA CAP and National documents.
+        substance: Optional active substance name filter for backfill.
+        limit: Optional maximum number of medicines to query in backfill.
 
     Returns:
         Audit report dict summarizing scraped data and file integrity.
@@ -1765,7 +1904,18 @@ def retrieve_infomed_rcms(
         benchmark = fetch_portal_benchmark_stats(page)
         page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=20000)
 
-        if not stage_2_only:
+        if backfill_ema:
+            backfill_ema_and_missing_documents(
+                page,
+                db_path=db_path,
+                target_url=TARGET_URL,
+                download_dir_rcms=DOWNLOAD_DIR_RCMS,
+                download_dir_leaflets=DOWNLOAD_DIR_LEAFLETS,
+                download_dir_mmr=DOWNLOAD_DIR_MMR,
+                limit=limit,
+                substance=substance,
+            )
+        elif not stage_2_only:
             # Dimension 1: WHO ATC Traversal (Default)
             browser, context, page = run_dimension_sweep(
                 sweep_name="1. WHO ATC Traversal",
@@ -2074,6 +2224,24 @@ def parse_cli_args() -> argparse.Namespace:
         help="Execute sweep across Documentos MMR filters (2 categories).",
     )
     parser.add_argument(
+        "--backfill-ema-docs",
+        action="store_true",
+        dest="backfill_ema",
+        help="Backfill missing EMA CAP and National documents for existing medicines.",
+    )
+    parser.add_argument(
+        "--substance",
+        type=str,
+        default=None,
+        help="Optional active substance filter for backfill (e.g. 'Siponimod').",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optional limit on the number of medicines to query in backfill.",
+    )
+    parser.add_argument(
         "--no-headless",
         action="store_false",
         dest="headless",
@@ -2106,4 +2274,7 @@ if __name__ == "__main__":
         sweep_margem=args.sweep_margem,
         sweep_monit=args.sweep_monit,
         sweep_mmr=args.sweep_mmr,
+        backfill_ema=args.backfill_ema,
+        substance=args.substance,
+        limit=args.limit,
     )
