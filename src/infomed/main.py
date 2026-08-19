@@ -1851,7 +1851,8 @@ def retrieve_infomed_rcms(
     sweep_margem: bool = False,
     sweep_monit: bool = False,
     sweep_mmr: bool = False,
-    backfill_ema: bool = False,
+    skip_backfill: bool = False,
+    backfill_only: bool = False,
     substance: Optional[str] = None,
     limit: Optional[int] = None,
 ) -> Dict[str, Any]:
@@ -1873,7 +1874,8 @@ def retrieve_infomed_rcms(
         sweep_margem: Sweep Margem Terapêutica filters (2 categories).
         sweep_monit: Sweep Monitorização Adicional filters (2 categories).
         sweep_mmr: Sweep Existência de MMR filters (2 categories).
-        backfill_ema: Backfill missing EMA CAP and National documents.
+        skip_backfill: Skip automatic Stage 3 EMA and missing doc backfill pass.
+        backfill_only: Run only the EMA and missing doc backfill without sweeps.
         substance: Optional active substance name filter for backfill.
         limit: Optional maximum number of medicines to query in backfill.
 
@@ -1904,18 +1906,7 @@ def retrieve_infomed_rcms(
         benchmark = fetch_portal_benchmark_stats(page)
         page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=20000)
 
-        if backfill_ema:
-            backfill_ema_and_missing_documents(
-                page,
-                db_path=db_path,
-                target_url=TARGET_URL,
-                download_dir_rcms=DOWNLOAD_DIR_RCMS,
-                download_dir_leaflets=DOWNLOAD_DIR_LEAFLETS,
-                download_dir_mmr=DOWNLOAD_DIR_MMR,
-                limit=limit,
-                substance=substance,
-            )
-        elif not stage_2_only:
+        if not stage_2_only and not backfill_only:
             # Dimension 1: WHO ATC Traversal (Default)
             browser, context, page = run_dimension_sweep(
                 sweep_name="1. WHO ATC Traversal",
@@ -2096,17 +2087,34 @@ def retrieve_infomed_rcms(
                 )
 
         # Stage 2: Retry Downloads of Missing Files
-        if page.is_closed():
-            browser, context, page = create_browser_session(p, headless=headless)
+        if not backfill_only:
+            if page.is_closed():
+                browser, context, page = create_browser_session(p, headless=headless)
 
-        retry_missing_documents(
-            page,
-            TARGET_URL,
-            db_path=db_path,
-            download_dir_rcms=DOWNLOAD_DIR_RCMS,
-            download_dir_leaflets=DOWNLOAD_DIR_LEAFLETS,
-            download_dir_mmr=DOWNLOAD_DIR_MMR,
-        )
+            retry_missing_documents(
+                page,
+                TARGET_URL,
+                db_path=db_path,
+                download_dir_rcms=DOWNLOAD_DIR_RCMS,
+                download_dir_leaflets=DOWNLOAD_DIR_LEAFLETS,
+                download_dir_mmr=DOWNLOAD_DIR_MMR,
+            )
+
+        # Stage 3: Automatic EMA & Missing Document Backfill (Runs by default)
+        if not skip_backfill or backfill_only:
+            if page.is_closed():
+                browser, context, page = create_browser_session(p, headless=headless)
+
+            backfill_ema_and_missing_documents(
+                page,
+                db_path=db_path,
+                target_url=TARGET_URL,
+                download_dir_rcms=DOWNLOAD_DIR_RCMS,
+                download_dir_leaflets=DOWNLOAD_DIR_LEAFLETS,
+                download_dir_mmr=DOWNLOAD_DIR_MMR,
+                limit=limit,
+                substance=substance,
+            )
 
         try:
             page.close()
@@ -2224,10 +2232,17 @@ def parse_cli_args() -> argparse.Namespace:
         help="Execute sweep across Documentos MMR filters (2 categories).",
     )
     parser.add_argument(
+        "--skip-backfill",
+        action="store_true",
+        dest="skip_backfill",
+        help="Skip automatic Stage 3 EMA and missing document backfill pass.",
+    )
+    parser.add_argument(
+        "--backfill-only",
         "--backfill-ema-docs",
         action="store_true",
-        dest="backfill_ema",
-        help="Backfill missing EMA CAP and National documents for existing medicines.",
+        dest="backfill_only",
+        help="Run only the EMA and missing document backfill without sweeps.",
     )
     parser.add_argument(
         "--substance",
@@ -2274,7 +2289,8 @@ if __name__ == "__main__":
         sweep_margem=args.sweep_margem,
         sweep_monit=args.sweep_monit,
         sweep_mmr=args.sweep_mmr,
-        backfill_ema=args.backfill_ema,
+        skip_backfill=args.skip_backfill,
+        backfill_only=args.backfill_only,
         substance=args.substance,
         limit=args.limit,
     )

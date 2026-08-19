@@ -406,7 +406,7 @@ def test_cli_parser_backfill_args(monkeypatch):
         "sys.argv",
         [
             "main.py",
-            "--backfill-ema-docs",
+            "--backfill-only",
             "--substance",
             "Siponimod",
             "--limit",
@@ -414,6 +414,7 @@ def test_cli_parser_backfill_args(monkeypatch):
         ],
     )
     args = parse_cli_args()
-    assert args.backfill_ema is True
+    assert args.backfill_only is True
+    assert args.skip_backfill is False
     assert args.substance == "Siponimod"
     assert args.limit == 5
