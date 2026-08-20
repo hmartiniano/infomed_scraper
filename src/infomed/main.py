@@ -1300,7 +1300,7 @@ def backfill_ema_and_missing_documents(
         if substance:
             cursor.execute(
                 """
-                SELECT DISTINCT drug_name, med_id, active_substance
+                SELECT DISTINCT drug_name, active_substance
                 FROM medicamentos
                 WHERE (has_rcm = 0 OR has_fi = 0
                        OR rcm_downloaded = 0 OR fi_downloaded = 0)
@@ -1312,7 +1312,7 @@ def backfill_ema_and_missing_documents(
         else:
             cursor.execute(
                 """
-                SELECT DISTINCT drug_name, med_id, active_substance
+                SELECT DISTINCT drug_name, active_substance
                 FROM medicamentos
                 WHERE (has_rcm = 0 OR has_fi = 0
                        OR rcm_downloaded = 0 OR fi_downloaded = 0)
@@ -1841,7 +1841,8 @@ def retrieve_infomed_rcms(
     stage_2_only: bool = False,
     sweep_all: bool = False,
     sweep_dispensa: bool = False,
-    sweep_cft: bool = False,
+    sweep_cft: bool = True,
+    sweep_atc: bool = True,
     sweep_ff: bool = False,
     sweep_via: bool = False,
     sweep_grupo: bool = False,
@@ -1865,6 +1866,7 @@ def retrieve_infomed_rcms(
         sweep_all: Run full sweep across all 12 classification dimensions.
         sweep_dispensa: Sweep Dispensa classifications (8 categories).
         sweep_cft: Sweep Farmacoterapêutica classifications (380 categories).
+        sweep_atc: Sweep WHO ATC classifications (3,193 categories).
         sweep_ff: Sweep Forma Farmacêutica classifications (339 categories).
         sweep_via: Sweep Via de Administração classifications (66 categories).
         sweep_grupo: Sweep Grupo de Produto classifications (18 categories).
@@ -1907,26 +1909,12 @@ def retrieve_infomed_rcms(
         page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=20000)
 
         if not stage_2_only and not backfill_only:
-            # Dimension 1: WHO ATC Traversal (Default)
-            browser, context, page = run_dimension_sweep(
-                sweep_name="1. WHO ATC Traversal",
-                selector=ATC_DROPDOWN_SELECTOR,
-                progress_table="atc_progress",
-                browser=browser,
-                context=context,
-                page=page,
-                p=p,
-                db_path=db_path,
-                headless=headless,
-                downloaded_files=downloaded_files,
-            )
-
-            # Dimension 2: Classificação Quanto à Dispensa
-            if sweep_all or sweep_dispensa:
+            # Dimension 1: Classificação Farmacoterapêutica (CFT - Default First)
+            if sweep_all or sweep_cft:
                 browser, context, page = run_dimension_sweep(
-                    sweep_name="2. Dispensa Classes",
-                    selector=DISPENSA_DROPDOWN_SELECTOR,
-                    progress_table="dispensa_progress",
+                    sweep_name="1. Farmacoterapêutica (CFT)",
+                    selector=CFT_DROPDOWN_SELECTOR,
+                    progress_table="cft_progress",
                     browser=browser,
                     context=context,
                     page=page,
@@ -1936,12 +1924,27 @@ def retrieve_infomed_rcms(
                     downloaded_files=downloaded_files,
                 )
 
-            # Dimension 3: Classificação Farmacoterapêutica (CFT)
-            if sweep_all or sweep_cft:
+            # Dimension 2: WHO ATC Traversal (Default Second)
+            if sweep_all or sweep_atc:
                 browser, context, page = run_dimension_sweep(
-                    sweep_name="3. Farmacoterapêutica",
-                    selector=CFT_DROPDOWN_SELECTOR,
-                    progress_table="cft_progress",
+                    sweep_name="2. WHO ATC Traversal",
+                    selector=ATC_DROPDOWN_SELECTOR,
+                    progress_table="atc_progress",
+                    browser=browser,
+                    context=context,
+                    page=page,
+                    p=p,
+                    db_path=db_path,
+                    headless=headless,
+                    downloaded_files=downloaded_files,
+                )
+
+            # Dimension 3: Classificação Quanto à Dispensa
+            if sweep_all or sweep_dispensa:
+                browser, context, page = run_dimension_sweep(
+                    sweep_name="3. Dispensa Classes",
+                    selector=DISPENSA_DROPDOWN_SELECTOR,
+                    progress_table="dispensa_progress",
                     browser=browser,
                     context=context,
                     page=page,
@@ -2172,7 +2175,27 @@ def parse_cli_args() -> argparse.Namespace:
         "--cft",
         action="store_true",
         dest="sweep_cft",
-        help="Execute sweep across Classificação Farmacoterapêutica (380 categories).",
+        default=True,
+        help="Execute sweep across CFT classification (380 categories).",
+    )
+    parser.add_argument(
+        "--skip-cft",
+        action="store_false",
+        dest="sweep_cft",
+        help="Skip default Stage 1 Classificação Farmacoterapêutica (CFT) sweep.",
+    )
+    parser.add_argument(
+        "--atc",
+        action="store_true",
+        dest="sweep_atc",
+        default=True,
+        help="Execute sweep across WHO ATC (3,193 categories, default: enabled).",
+    )
+    parser.add_argument(
+        "--skip-atc",
+        action="store_false",
+        dest="sweep_atc",
+        help="Skip default Stage 2 WHO ATC classification sweep.",
     )
     parser.add_argument(
         "--ff",
@@ -2280,6 +2303,7 @@ if __name__ == "__main__":
         sweep_all=args.sweep_all,
         sweep_dispensa=args.sweep_dispensa,
         sweep_cft=args.sweep_cft,
+        sweep_atc=args.sweep_atc,
         sweep_ff=args.sweep_ff,
         sweep_via=args.sweep_via,
         sweep_grupo=args.sweep_grupo,
