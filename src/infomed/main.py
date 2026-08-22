@@ -43,7 +43,7 @@ DOWNLOAD_DIR_MMR = "downloads/mmr"
 
 # Memory optimization recycling intervals
 CONTEXT_RECYCLE_INTERVAL = 25
-BROWSER_RECYCLE_INTERVAL = 100
+BROWSER_RECYCLE_INTERVAL = 20
 
 # Low-memory Chromium flags
 CHROMIUM_LOW_MEM_ARGS = [
@@ -55,6 +55,8 @@ CHROMIUM_LOW_MEM_ARGS = [
     "--disable-background-networking",
     "--disable-default-apps",
     "--disable-extensions",
+    "--renderer-process-limit=4",
+    "--disable-site-isolation-trials",
 ]
 
 # DOM Selectors on pesquisa-avancada.xhtml
@@ -833,6 +835,17 @@ def extract_atc_categories(page: Page) -> List[Dict[str, str]]:
     return extract_dropdown_options(page, ATC_DROPDOWN_SELECTOR, desc="ATC categories")
 
 
+def wait_for_primefaces_ajax(page: Page, timeout_ms: int = 15000) -> None:
+    """Wait until PrimeFaces AJAX queue is completely idle and DOM is settled."""
+    try:
+        page.wait_for_function(
+            "typeof PrimeFaces === 'undefined' || PrimeFaces.ajax.Queue.isEmpty()",
+            timeout=timeout_ms,
+        )
+    except Exception:
+        pass
+
+
 def select_dropdown_option(page: Page, selector: str, value: str) -> None:
     """Select option on a select dropdown."""
     page.wait_for_selector(selector, state="attached", timeout=10000)
@@ -842,6 +855,20 @@ def select_dropdown_option(page: Page, selector: str, value: str) -> None:
 def select_atc_option(page: Page, atc_value: str) -> None:
     """Select an ATC option."""
     select_dropdown_option(page, ATC_DROPDOWN_SELECTOR, atc_value)
+
+
+def close_secondary_pages(page: Page) -> None:
+    """Close extra/popup pages in context to prevent renderer process leaks."""
+    try:
+        if page and page.context:
+            for extra_page in page.context.pages:
+                if extra_page is not page:
+                    try:
+                        extra_page.close()
+                    except Exception:
+                        pass
+    except Exception:
+        pass
 
 
 def download_single_document(
@@ -872,6 +899,8 @@ def download_single_document(
     except Exception as err:
         logger.debug(f"Download trigger note for {doc_type} '{target_filepath}': {err}")
         return False
+    finally:
+        close_secondary_pages(page)
 
 
 def extract_medicine_row(
@@ -1063,9 +1092,16 @@ def process_dimension_category(
 
     page.wait_for_selector(SEARCH_BUTTON_SELECTOR, state="visible", timeout=15000)
     select_dropdown_option(page, selector, cat_value)
-    page.locator(SEARCH_BUTTON_SELECTOR).click(timeout=10000)
+    try:
+        with page.expect_response(
+            lambda r: "pesquisa-avancada.xhtml" in r.url and r.request.method == "POST",
+            timeout=20000,
+        ):
+            page.locator(SEARCH_BUTTON_SELECTOR).click(timeout=10000)
+    except Exception:
+        page.locator(SEARCH_BUTTON_SELECTOR).click(timeout=10000)
+    wait_for_primefaces_ajax(page)
     page.wait_for_selector(RESULTS_TABLE_SELECTOR, state="visible", timeout=15000)
-    page.wait_for_timeout(1000)
 
     os.makedirs(download_dir_rcms, exist_ok=True)
     os.makedirs(download_dir_leaflets, exist_ok=True)
@@ -1105,8 +1141,18 @@ def process_dimension_category(
 
         if next_button.is_visible() and not disabled_next.is_visible():
             page_num += 1
-            next_button.click(timeout=10000)
-            page.wait_for_timeout(1000)
+            try:
+                with page.expect_response(
+                    lambda r: (
+                        "pesquisa-avancada.xhtml" in r.url
+                        and r.request.method == "POST"
+                    ),
+                    timeout=20000,
+                ):
+                    next_button.click(timeout=10000)
+            except Exception:
+                next_button.click(timeout=10000)
+            wait_for_primefaces_ajax(page)
         else:
             break
 
@@ -1365,9 +1411,19 @@ def backfill_ema_and_missing_documents(
             time.sleep(0.3)
 
             search_btn = page.locator(SEARCH_BUTTON_SELECTOR)
-            search_btn.click()
+            try:
+                with page.expect_response(
+                    lambda r: (
+                        "pesquisa-avancada.xhtml" in r.url
+                        and r.request.method == "POST"
+                    ),
+                    timeout=20000,
+                ):
+                    search_btn.click()
+            except Exception:
+                search_btn.click()
+            wait_for_primefaces_ajax(page)
             page.wait_for_selector(TABLE_BODY_SELECTOR, timeout=20000)
-            time.sleep(1.0)
 
             # Extract rows returned
             table_rows = page.locator(f"{TABLE_BODY_SELECTOR} tr")
@@ -1786,6 +1842,7 @@ def run_dimension_sweep(
                 progress_table, code_val, opt.get("label", ""), db_path=db_path
             )
             count_in_session += 1
+            close_secondary_pages(page)
 
         except Exception as err:
             logger.error(f"Error processing {sweep_name} '{code_val}': {err}")

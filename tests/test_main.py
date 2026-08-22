@@ -6,6 +6,7 @@ from infomed.main import (
     FI_ICON_SELECTOR,
     RCM_ICON_SELECTOR,
     audit_documents_and_integrity,
+    close_secondary_pages,
     export_db_to_datasets,
     format_duration,
     init_db,
@@ -19,6 +20,7 @@ from infomed.main import (
     save_sweep_metrics,
     upsert_medicamentos_batch,
     validate_pdf,
+    wait_for_primefaces_ajax,
 )
 
 MINIMAL_VALID_PDF = (
@@ -418,3 +420,49 @@ def test_cli_parser_backfill_args(monkeypatch):
     assert args.skip_backfill is False
     assert args.substance == "Siponimod"
     assert args.limit == 5
+
+
+def test_close_secondary_pages():
+    """Test close_secondary_pages closes popup tabs without closing main page."""
+    from unittest.mock import MagicMock
+
+    main_page = MagicMock()
+    popup1 = MagicMock()
+    popup2 = MagicMock()
+
+    context = MagicMock()
+    context.pages = [main_page, popup1, popup2]
+    main_page.context = context
+
+    close_secondary_pages(main_page)
+
+    popup1.close.assert_called_once()
+    popup2.close.assert_called_once()
+    main_page.close.assert_not_called()
+
+
+def test_wait_for_primefaces_ajax_calls_wait_for_function():
+    """Verify wait_for_primefaces_ajax invokes wait_for_function with correct JS."""
+    from unittest.mock import MagicMock
+
+    mock_page = MagicMock()
+
+    wait_for_primefaces_ajax(mock_page, timeout_ms=5000)
+
+    mock_page.wait_for_function.assert_called_once_with(
+        "typeof PrimeFaces === 'undefined' || PrimeFaces.ajax.Queue.isEmpty()",
+        timeout=5000,
+    )
+
+
+def test_wait_for_primefaces_ajax_handles_timeout_gracefully():
+    """Verify wait_for_primefaces_ajax swallows exceptions without raising."""
+    from unittest.mock import MagicMock
+
+    mock_page = MagicMock()
+    mock_page.wait_for_function.side_effect = TimeoutError("timed out")
+
+    # Should not raise
+    wait_for_primefaces_ajax(mock_page)
+
+    mock_page.wait_for_function.assert_called_once()

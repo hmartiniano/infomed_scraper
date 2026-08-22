@@ -1,0 +1,2 @@
+<frozen runpy>:128: RuntimeWarning: 'infomed.main' found in sys.modules after import of package 'infomed', but prior to execution of 'infomed.main'; this may result in unpredictable behaviour
+2026-08-20 19:28:20,784 [INFO] Starting pipeline with unified SQLite: 9575 drugs in DB, 16184 PDFs saved.
