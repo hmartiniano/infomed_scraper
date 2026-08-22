@@ -12,3 +12,11 @@ medicamentos.json
 medicamentos.csv
 *.tar.gz
 *.tar
+
+# Temporary/generated files
+clinical_sections_pilot_results.json
+local_pipeline.log
+medicamentos.db-shm
+medicamentos.db-wal
+pgx_evaluation_report.json
+pilot_dedup_results.json
