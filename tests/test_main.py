@@ -8,7 +8,9 @@ from infomed.main import (
     audit_documents_and_integrity,
     close_secondary_pages,
     export_db_to_datasets,
+    fetch_ema_epar_document,
     format_duration,
+    generate_ema_candidate_slugs,
     init_db,
     load_all_medicamentos_from_db,
     load_all_sweep_metrics,
@@ -18,6 +20,7 @@ from infomed.main import (
     print_summary_table,
     sanitize_filename,
     save_sweep_metrics,
+    translate_portuguese_as_to_inn,
     upsert_medicamentos_batch,
     validate_pdf,
     wait_for_primefaces_ajax,
@@ -466,3 +469,55 @@ def test_wait_for_primefaces_ajax_handles_timeout_gracefully():
     wait_for_primefaces_ajax(mock_page)
 
     mock_page.wait_for_function.assert_called_once()
+
+
+def test_translate_portuguese_as_to_inn():
+    """Verify Portuguese AS translation to standard INN stems."""
+    assert translate_portuguese_as_to_inn("Pregabalina") == "pregabalin"
+    assert translate_portuguese_as_to_inn("Lenalidomida") == "lenalidomide"
+    assert translate_portuguese_as_to_inn("Olanzapina") == "olanzapin"
+    assert translate_portuguese_as_to_inn("Aripiprazol") == "aripiprazole"
+    assert (
+        translate_portuguese_as_to_inn("Darunavir + Cobicistate")
+        == "darunavir-cobicistate"
+    )
+
+
+def test_generate_ema_candidate_slugs():
+    """Verify candidate slug generation for EMA product information."""
+    slugs = generate_ema_candidate_slugs(
+        drug_name="Pregabalina SandozMG",
+        active_substance="Pregabalina",
+        mah="Sandoz GmbH",
+    )
+    assert "pregabalin-sandoz" in slugs
+    assert "pregabalina-sandoz" in slugs
+
+    prezista_slugs = generate_ema_candidate_slugs(
+        drug_name="Prezista", active_substance="Darunavir", mah="Janssen-Cilag"
+    )
+    assert "prezista" in prezista_slugs
+
+
+def test_fetch_ema_epar_document_success(tmp_path, monkeypatch):
+    """Verify fetch_ema_epar_document downloads when HTTP 200 is returned."""
+    from unittest.mock import MagicMock
+
+    fake_pdf = MINIMAL_VALID_PDF
+    target = str(tmp_path / "test_doc.pdf")
+
+    mock_resp = MagicMock()
+    mock_resp.status = 200
+    mock_resp.read.return_value = fake_pdf
+    mock_resp.__enter__.return_value = mock_resp
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout: mock_resp)
+
+    success = fetch_ema_epar_document(
+        drug_name="Prezista",
+        active_substance="Darunavir",
+        mah="Janssen",
+        target_filepath=target,
+    )
+    assert success is True
+    assert os.path.exists(target)

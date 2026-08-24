@@ -15,9 +15,11 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import sys
 import time
+import urllib.request
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from playwright.sync_api import Locator, Page, sync_playwright
@@ -871,6 +873,96 @@ def close_secondary_pages(page: Page) -> None:
         pass
 
 
+def translate_portuguese_as_to_inn(as_name: str) -> str:
+    """Translate Portuguese active substance names to European INN standard."""
+    s = as_name.lower().strip()
+    s = re.sub(r"\s*\+\s*", "-", s)
+    s = re.sub(r"[^a-z0-9\-]", "", s)
+    s = re.sub(r"ina$", "in", s)
+    s = re.sub(r"ona$", "one", s)
+    s = re.sub(r"ida$", "ide", s)
+    s = re.sub(r"azol$", "azole", s)
+    return s
+
+
+def generate_ema_candidate_slugs(
+    drug_name: str,
+    active_substance: Optional[str] = None,
+    mah: Optional[str] = None,
+) -> List[str]:
+    """Generate candidate URL slugs for EMA EPAR document resolution."""
+    clean_brand = re.sub(r"\(.*?\)", "", drug_name)
+    clean_brand = re.sub(r"(mg|mb|dp)$", "", clean_brand.strip(), flags=re.I)
+    clean_brand = re.sub(r"[^a-zA-Z0-9]", "-", clean_brand).strip("-").lower()
+    clean_brand = re.sub(r"-+", "-", clean_brand)
+
+    clean_mah = re.sub(r"[^a-zA-Z0-9]", "-", mah).strip("-").lower() if mah else ""
+    first_mah = clean_mah.split("-")[0] if clean_mah else ""
+
+    slugs: Set[str] = set()
+    if clean_brand:
+        slugs.add(clean_brand)
+        clean_brand_no_suf = re.sub(r"-(mg|mb|dp)$", "", clean_brand)
+        slugs.add(clean_brand_no_suf)
+        if first_mah and first_mah not in clean_brand:
+            slugs.add(f"{clean_brand}-{first_mah}")
+            slugs.add(f"{clean_brand_no_suf}-{first_mah}")
+
+    if active_substance:
+        inn = translate_portuguese_as_to_inn(active_substance)
+        if inn:
+            slugs.add(inn)
+            if first_mah:
+                slugs.add(f"{inn}-{first_mah}")
+            if clean_brand and clean_brand != inn:
+                slugs.add(f"{inn}-{clean_brand}")
+                slugs.add(f"{inn}-{clean_brand_no_suf}")
+
+        alt_inn = re.sub(r"in$", "ine", inn)
+        if alt_inn != inn:
+            slugs.add(alt_inn)
+            if first_mah:
+                slugs.add(f"{alt_inn}-{first_mah}")
+
+    return sorted(list(slugs), key=lambda x: (len(x), x))
+
+
+def fetch_ema_epar_document(
+    drug_name: str,
+    active_substance: Optional[str] = None,
+    mah: Optional[str] = None,
+    target_filepath: str = "",
+    doc_type: str = "RCM",
+    timeout_secs: int = 10,
+) -> bool:
+    """Fetch Centrally Authorized Product EPAR PDF directly from EMA."""
+    if os.path.exists(target_filepath) and validate_pdf(target_filepath):
+        return True
+
+    slugs = generate_ema_candidate_slugs(drug_name, active_substance, mah)
+    for slug in slugs:
+        for lang in ("pt", "en"):
+            url = f"https://www.ema.europa.eu/{lang}/documents/product-information/{slug}-epar-product-information_{lang}.pdf"
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=timeout_secs) as resp:
+                    if resp.status == 200:
+                        content = resp.read()
+                        os.makedirs(os.path.dirname(target_filepath), exist_ok=True)
+                        with open(target_filepath, "wb") as f:
+                            f.write(content)
+                        if validate_pdf(target_filepath):
+                            logger.info(
+                                f"Successfully resolved {doc_type} via EMA EPAR: "
+                                f"'{slug}' -> '{target_filepath}'"
+                            )
+                            return True
+            except Exception:
+                continue
+
+    return False
+
+
 def download_single_document(
     icon_locator: Locator,
     target_filepath: str,
@@ -1456,6 +1548,104 @@ def backfill_ema_and_missing_documents(
 
         except Exception as err:
             logger.warning(f"Error backfilling '{search_term}': {err}")
+
+    # Pass 2: Direct INN-normalized EMA EPAR Resolver for remaining missing documents
+    logger.info(
+        "Executing Direct EMA EPAR Resolver pass for remaining missing "
+        "SmPCs/Leaflets..."
+    )
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT id_key, med_id, drug_name, active_substance, mah,
+               has_rcm, rcm_downloaded, has_fi, fi_downloaded
+        FROM medicamentos
+        WHERE (has_rcm = 1 AND rcm_downloaded = 0)
+           OR (has_fi = 1 AND fi_downloaded = 0)
+        """
+    )
+    unresolved = c.fetchall()
+    conn.close()
+
+    for item in unresolved:
+        id_k, m_id, d_name, a_sub, mah_val, h_rcm, r_dl, h_fi, f_dl = item
+        if not d_name and not a_sub:
+            continue
+
+        base_name = (
+            sanitize_filename(f"{m_id}_{d_name}")
+            if m_id and d_name
+            else sanitize_filename(id_k)
+        )
+        rcm_path = os.path.join(download_dir_rcms, f"{base_name}.pdf")
+        fi_path = os.path.join(download_dir_leaflets, f"{base_name}_FI.pdf")
+
+        rcm_ok = r_dl == 1
+        fi_ok = f_dl == 1
+
+        if h_rcm and not rcm_ok:
+            if fetch_ema_epar_document(
+                drug_name=d_name,
+                active_substance=a_sub,
+                mah=mah_val,
+                target_filepath=rcm_path,
+                doc_type="RCM",
+            ):
+                rcm_ok = True
+                recovered_rcms += 1
+                if downloaded_files is not None:
+                    downloaded_files.add(f"{base_name}.pdf")
+
+        if h_fi and not fi_ok:
+            if rcm_ok and os.path.exists(rcm_path) and not os.path.exists(fi_path):
+                try:
+                    shutil.copy2(rcm_path, fi_path)
+                    if validate_pdf(fi_path):
+                        fi_ok = True
+                        recovered_fis += 1
+                        if downloaded_files is not None:
+                            downloaded_files.add(f"{base_name}_FI.pdf")
+                except Exception:
+                    pass
+            elif fetch_ema_epar_document(
+                drug_name=d_name,
+                active_substance=a_sub,
+                mah=mah_val,
+                target_filepath=fi_path,
+                doc_type="Leaflet",
+            ):
+                fi_ok = True
+                recovered_fis += 1
+                if downloaded_files is not None:
+                    downloaded_files.add(f"{base_name}_FI.pdf")
+
+        if rcm_ok != (r_dl == 1) or fi_ok != (f_dl == 1):
+            conn = sqlite3.connect(db_path)
+            c = conn.cursor()
+            c.execute(
+                """
+                UPDATE medicamentos
+                SET rcm_downloaded = ?, rcm_verified = ?,
+                    rcm_source_sweep = CASE WHEN ? = 1 THEN 'EMA Direct EPAR Resolver'
+                                            ELSE rcm_source_sweep END,
+                    fi_downloaded = ?, fi_verified = ?,
+                    fi_source_sweep = CASE WHEN ? = 1 THEN 'EMA Direct EPAR Resolver'
+                                           ELSE fi_source_sweep END
+                WHERE id_key = ?
+                """,
+                (
+                    1 if rcm_ok else 0,
+                    1 if rcm_ok else 0,
+                    1 if (rcm_ok and r_dl == 0) else 0,
+                    1 if fi_ok else 0,
+                    1 if fi_ok else 0,
+                    1 if (fi_ok and f_dl == 0) else 0,
+                    id_k,
+                ),
+            )
+            conn.commit()
+            conn.close()
 
     logger.info(
         f"EMA Backfill finished: Downloaded {recovered_rcms} RCMs and "
