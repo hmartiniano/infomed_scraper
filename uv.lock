@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -91,20 +91,30 @@ name = "infomed"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "numpy" },
     { name = "playwright" },
     { name = "pypdf" },
+    { name = "scikit-learn" },
+]
+
+[package.dev-dependencies]
+dev = [
     { name = "pytest" },
     { name = "ruff" },
-    { name = "scikit-learn" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "numpy", specifier = ">=2.0.0" },
     { name = "playwright", specifier = ">=1.61.0" },
     { name = "pypdf", specifier = ">=6.16.1" },
+    { name = "scikit-learn", specifier = ">=1.9.0" },
+]
+
+[package.metadata.requires-dev]
+dev = [
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "ruff", specifier = ">=0.16.0" },
-    { name = "scikit-learn", specifier = ">=1.9.0" },
 ]
 
 [[package]]

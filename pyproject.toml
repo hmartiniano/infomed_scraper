@@ -5,12 +5,21 @@ description = "Scraper for Infomed RCM documents"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "numpy>=2.0.0",
     "playwright>=1.61.0",
     "pypdf>=6.16.1",
-    "pytest>=9.1.1",
-    "ruff>=0.16.0",
     "scikit-learn>=1.9.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.0",
+]
+
+[project.scripts]
+infomed = "infomed.main:main"
+infomed-dedup = "infomed.dedup:main"
 
 [build-system]
 requires = ["hatchling"]
